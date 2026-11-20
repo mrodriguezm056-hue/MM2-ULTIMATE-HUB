@@ -1,0 +1,3145 @@
+-- ============================================================================
+-- 1. ReplicatedStorage/AutoPredictionEngine (ModuleScript)
+-- ============================================================================
+--!strict
+export type AxisWeights = {
+	X: number,
+	Y: number,
+	Z: number,
+}
+
+export type PredictionConfig = {
+	AutoPrediction: boolean,
+	PredictionStrength: number,
+	AxisWeights: AxisWeights,
+	DynamicPrediction: boolean,
+	PingCompensation: boolean,
+	PingSeconds: number,
+	ProjectileSpeed: number,
+	MaxPredictionTime: number,
+	VelocityAlpha: number,
+	AccelerationAlpha: number,
+	MaxSpeed: number,
+	MaxAcceleration: number,
+}
+
+export type ErrorSample = {
+	id: number,
+	targetId: string,
+	predictedTime: number,
+	distanceStuds: number,
+	speedStudsPerSec: number,
+	errorStuds: number,
+	simulated: boolean,
+	timestamp: number,
+}
+
+export type ErrorSummary = {
+	count: number,
+	lastError: number?,
+	meanError: number?,
+	maxError: number?,
+}
+
+type TargetState = {
+	sampleCount: number,
+	lastPos: Vector3,
+	lastTime: number,
+	hasPrevVel: boolean,
+	velocity: Vector3,
+	acceleration: Vector3,
+}
+
+type PendingCheck = {
+	id: number,
+	targetId: string,
+	predictedPos: Vector3,
+	evaluateAt: number,
+	scheduledTime: number,
+	distanceStuds: number,
+	speedStudsPerSec: number,
+	simulated: boolean,
+	getCurrentPos: () -> Vector3?,
+}
+
+local AutoPredictionEngine = {}
+AutoPredictionEngine.__index = AutoPredictionEngine
+
+local MIN_VALID_DT = 1 / 500
+local MAX_VALID_DT = 0.25
+
+local function isFiniteNumber(n: unknown): boolean
+	return type(n) == "number" and n == n and math.abs(n) ~= math.huge
+end
+
+local function sanitizeNumber(val: unknown, fallback: number, minVal: number?, maxVal: number?): number
+	if not isFiniteNumber(val) then
+		return fallback
+	end
+	local num = val :: number
+	if minVal ~= nil and num < minVal then
+		num = minVal
+	end
+	if maxVal ~= nil and num > maxVal then
+		num = maxVal
+	end
+	return num
+end
+
+local function clampVectorMagnitude(vec: Vector3, maxMag: number): Vector3
+	local mag = vec.Magnitude
+	if mag ~= mag or mag == math.huge then
+		return Vector3.zero
+	end
+	if mag > maxMag and mag > 1e-6 then
+		return vec.Unit * maxMag
+	end
+	return vec
+end
+
+function AutoPredictionEngine.new(customConfig: Partial<PredictionConfig>?): any
+	local config: PredictionConfig = {
+		AutoPrediction = true,
+		PredictionStrength = 1.0,
+		AxisWeights = { X = 1.0, Y = 1.0, Z = 1.0 },
+		DynamicPrediction = true,
+		PingCompensation = false,
+		PingSeconds = 0.0,
+		ProjectileSpeed = 120,
+		MaxPredictionTime = 1.0,
+		VelocityAlpha = 0.35,
+		AccelerationAlpha = 0.20,
+		MaxSpeed = 250,
+		MaxAcceleration = 600,
+	}
+
+	local self = {
+		config = config,
+		targets = {} :: { [string]: TargetState },
+		pendingChecks = {} :: { PendingCheck },
+		samples = {} :: { ErrorSample },
+		nextCheckId = 1,
+		maxSamples = 500,
+	}
+
+	setmetatable(self, AutoPredictionEngine)
+
+	if customConfig then
+		self:SetConfig(customConfig)
+	end
+
+	return self
+end
+
+function AutoPredictionEngine:SetConfig(partial: Partial<PredictionConfig>)
+	local cfg = self.config
+	if type(partial.AutoPrediction) == "boolean" then
+		cfg.AutoPrediction = partial.AutoPrediction
+	end
+	if partial.PredictionStrength ~= nil then
+		cfg.PredictionStrength = sanitizeNumber(partial.PredictionStrength, cfg.PredictionStrength, 0, 5)
+	end
+	if partial.PingCompensation ~= nil and type(partial.PingCompensation) == "boolean" then
+		cfg.PingCompensation = partial.PingCompensation
+	end
+	if partial.DynamicPrediction ~= nil and type(partial.DynamicPrediction) == "boolean" then
+		cfg.DynamicPrediction = partial.DynamicPrediction
+	end
+	if partial.PingSeconds ~= nil then
+		cfg.PingSeconds = sanitizeNumber(partial.PingSeconds, cfg.PingSeconds, 0, 2.0)
+	end
+	if partial.ProjectileSpeed ~= nil then
+		cfg.ProjectileSpeed = sanitizeNumber(partial.ProjectileSpeed, cfg.ProjectileSpeed, 0, 5000)
+	end
+	if partial.MaxPredictionTime ~= nil then
+		cfg.MaxPredictionTime = sanitizeNumber(partial.MaxPredictionTime, cfg.MaxPredictionTime, 0.01, 5.0)
+	end
+	if partial.VelocityAlpha ~= nil then
+		cfg.VelocityAlpha = sanitizeNumber(partial.VelocityAlpha, cfg.VelocityAlpha, 0.01, 1.0)
+	end
+	if partial.AccelerationAlpha ~= nil then
+		cfg.AccelerationAlpha = sanitizeNumber(partial.AccelerationAlpha, cfg.AccelerationAlpha, 0.01, 1.0)
+	end
+	if partial.MaxSpeed ~= nil then
+		cfg.MaxSpeed = sanitizeNumber(partial.MaxSpeed, cfg.MaxSpeed, 1, 5000)
+	end
+	if partial.MaxAcceleration ~= nil then
+		cfg.MaxAcceleration = sanitizeNumber(partial.MaxAcceleration, cfg.MaxAcceleration, 1, 20000)
+	end
+	if type(partial.AxisWeights) == "table" then
+		cfg.AxisWeights = {
+			X = sanitizeNumber(partial.AxisWeights.X, cfg.AxisWeights.X, -5, 5),
+			Y = sanitizeNumber(partial.AxisWeights.Y, cfg.AxisWeights.Y, -5, 5),
+			Z = sanitizeNumber(partial.AxisWeights.Z, cfg.AxisWeights.Z, -5, 5),
+		}
+	end
+end
+
+function AutoPredictionEngine:ResetTarget(targetId: string)
+	self.targets[targetId] = nil
+	for i = #self.pendingChecks, 1, -1 do
+		if self.pendingChecks[i].targetId == targetId then
+			table.remove(self.pendingChecks, i)
+		end
+	end
+end
+
+function AutoPredictionEngine:ClearAllTargets()
+	table.clear(self.targets)
+	table.clear(self.pendingChecks)
+end
+
+function AutoPredictionEngine:ClearSamples()
+	table.clear(self.samples)
+end
+
+function AutoPredictionEngine:UpdateTarget(targetId: string, currentPos: Vector3, now: number?): TargetState
+	local t = sanitizeNumber(now, os.clock(), 0, math.huge)
+	local state = self.targets[targetId]
+
+	if not state then
+		state = {
+			sampleCount = 1,
+			lastPos = currentPos,
+			lastTime = t,
+			hasPrevVel = false,
+			velocity = Vector3.zero,
+			acceleration = Vector3.zero,
+		}
+		self.targets[targetId] = state
+		return state
+	end
+
+	local rawDt = t - state.lastTime
+	if rawDt < MIN_VALID_DT then
+		return state
+	end
+
+	if rawDt > MAX_VALID_DT then
+		state.sampleCount = 1
+		state.lastPos = currentPos
+		state.lastTime = t
+		state.hasPrevVel = false
+		state.velocity = Vector3.zero
+		state.acceleration = Vector3.zero
+		return state
+	end
+
+	local deltaPos = currentPos - state.lastPos
+	local rawVel = clampVectorMagnitude(deltaPos / rawDt, self.config.MaxSpeed)
+
+	if state.sampleCount == 1 then
+		state.velocity = rawVel
+		state.sampleCount = 2
+	else
+		local nextVel = clampVectorMagnitude(state.velocity:Lerp(rawVel, self.config.VelocityAlpha), self.config.MaxSpeed)
+		local rawAcc = clampVectorMagnitude((nextVel - state.velocity) / rawDt, self.config.MaxAcceleration)
+
+		if not state.hasPrevVel then
+			state.acceleration = rawAcc
+			state.hasPrevVel = true
+		else
+			state.acceleration = clampVectorMagnitude(
+				state.acceleration:Lerp(rawAcc, self.config.AccelerationAlpha),
+				self.config.MaxAcceleration
+			)
+		end
+
+		state.velocity = nextVel
+		state.sampleCount += 1
+	end
+
+	state.lastPos = currentPos
+	state.lastTime = t
+	return state
+end
+
+function AutoPredictionEngine:ComputePredictionTime(originPos: Vector3, targetPos: Vector3, speed: number): number
+	local cfg: PredictionConfig = self.config
+	local dist = (targetPos - originPos).Magnitude
+
+	local flightTime = 0
+	if cfg.ProjectileSpeed > 1e-3 then
+		flightTime = dist / cfg.ProjectileSpeed
+	end
+
+	local pingTime = if cfg.PingCompensation then cfg.PingSeconds else 0
+	local totalTime = flightTime + pingTime
+
+	if cfg.DynamicPrediction then
+		local speedFactor = math.clamp(speed / 16, 0.25, 1.15)
+		local distanceFactor = 1 / (1 + (dist / 400) ^ 2)
+		totalTime = totalTime * speedFactor * distanceFactor
+	end
+
+	return math.clamp(totalTime, 0, cfg.MaxPredictionTime)
+end
+
+function AutoPredictionEngine:Predict(
+	targetId: string,
+	originPos: Vector3,
+	currentPos: Vector3,
+	now: number?
+): (Vector3, number, Vector3, { velocity: Vector3, acceleration: Vector3, distance: number, hasEnoughSamples: boolean })
+	local t = sanitizeNumber(now, os.clock(), 0, math.huge)
+	local state = self:UpdateTarget(targetId, currentPos, t)
+	local dist = (currentPos - originPos).Magnitude
+	local hasEnoughSamples = state.sampleCount >= 2
+	local effectiveVel = if hasEnoughSamples then state.velocity else Vector3.zero
+	local effectiveAcc = if state.hasPrevVel then state.acceleration else Vector3.zero
+
+	local info = {
+		velocity = effectiveVel,
+		acceleration = effectiveAcc,
+		distance = dist,
+		hasEnoughSamples = hasEnoughSamples,
+	}
+
+	if not self.config.AutoPrediction or not hasEnoughSamples then
+		return currentPos, 0, Vector3.zero, info
+	end
+
+	local predTime = self:ComputePredictionTime(originPos, currentPos, effectiveVel.Magnitude)
+	local rawDelta = effectiveVel * predTime + 0.5 * effectiveAcc * (predTime * predTime)
+
+	local weights = self.config.AxisWeights
+	local strength = self.config.PredictionStrength
+
+	local scaledDelta = Vector3.new(
+		rawDelta.X * weights.X * strength,
+		rawDelta.Y * weights.Y * strength,
+		rawDelta.Z * weights.Z * strength
+	)
+
+	local predictedPos = currentPos + scaledDelta
+	return predictedPos, predTime, scaledDelta, info
+end
+
+function AutoPredictionEngine:RecordErrorSample(
+	targetId: string,
+	predictedPos: Vector3,
+	actualPos: Vector3,
+	predictedTime: number,
+	distanceStuds: number,
+	speedStudsPerSec: number,
+	simulated: boolean?,
+	now: number?
+): ErrorSample
+	local errStuds = (predictedPos - actualPos).Magnitude
+	local sample: ErrorSample = {
+		id = self.nextCheckId,
+		targetId = targetId,
+		predictedTime = predictedTime,
+		distanceStuds = distanceStuds,
+		speedStudsPerSec = speedStudsPerSec,
+		errorStuds = errStuds,
+		simulated = if simulated == nil then false else simulated,
+		timestamp = sanitizeNumber(now, os.clock(), 0, math.huge),
+	}
+
+	self.nextCheckId += 1
+	table.insert(self.samples, sample)
+	if #self.samples > self.maxSamples then
+		table.remove(self.samples, 1)
+	end
+
+	return sample
+end
+
+function AutoPredictionEngine:ScheduleEvaluation(
+	targetId: string,
+	predictedPos: Vector3,
+	predictedTime: number,
+	distanceStuds: number,
+	speedStudsPerSec: number,
+	getCurrentPos: () -> Vector3?,
+	simulated: boolean?,
+	now: number?
+): number?
+	local t = sanitizeNumber(now, os.clock(), 0, math.huge)
+	local isSim = if simulated == nil then false else simulated
+
+	if predictedTime <= 1e-4 then
+		local actual = getCurrentPos()
+		if actual then
+			local rec = self:RecordErrorSample(
+				targetId,
+				predictedPos,
+				actual,
+				0,
+				distanceStuds,
+				speedStudsPerSec,
+				isSim,
+				t
+			)
+			return rec.id
+		end
+		return nil
+	end
+
+	for _, existing in ipairs(self.pendingChecks) do
+		if existing.targetId == targetId and math.abs(existing.evaluateAt - (t + predictedTime)) < 1e-3 then
+			return existing.id
+		end
+	end
+
+	local id = self.nextCheckId
+	self.nextCheckId += 1
+
+	table.insert(self.pendingChecks, {
+		id = id,
+		targetId = targetId,
+		predictedPos = predictedPos,
+		evaluateAt = t + predictedTime,
+		scheduledTime = predictedTime,
+		distanceStuds = distanceStuds,
+		speedStudsPerSec = speedStudsPerSec,
+		simulated = isSim,
+		getCurrentPos = getCurrentPos,
+	})
+
+	return id
+end
+
+function AutoPredictionEngine:StepEvaluations(now: number?): { ErrorSample }
+	local t = sanitizeNumber(now, os.clock(), 0, math.huge)
+	local completed: { ErrorSample } = {}
+
+	for i = #self.pendingChecks, 1, -1 do
+		local check = self.pendingChecks[i]
+		if t >= check.evaluateAt then
+			table.remove(self.pendingChecks, i)
+			local actualPos = check.getCurrentPos()
+			if actualPos then
+				local sample = self:RecordErrorSample(
+					check.targetId,
+					check.predictedPos,
+					actualPos,
+					check.scheduledTime,
+					check.distanceStuds,
+					check.speedStudsPerSec,
+					check.simulated,
+					t
+				)
+				table.insert(completed, sample)
+			end
+		end
+	end
+
+	return completed
+end
+
+function AutoPredictionEngine:GetErrorSummary(targetId: string?, simulatedFilter: boolean?): ErrorSummary
+	local count = 0
+	local sum = 0
+	local maxErr: number? = nil
+	local lastErr: number? = nil
+
+	for _, s in ipairs(self.samples) do
+		local matchId = (targetId == nil or s.targetId == targetId)
+		local matchSim = (simulatedFilter == nil or s.simulated == simulatedFilter)
+		if matchId and matchSim then
+			count += 1
+			sum += s.errorStuds
+			lastErr = s.errorStuds
+			if maxErr == nil or s.errorStuds > maxErr then
+				maxErr = s.errorStuds
+			end
+		end
+	end
+
+	if count == 0 then
+		return { count = 0, lastError = nil, meanError = nil, maxError = nil }
+	end
+
+	return {
+		count = count,
+		lastError = lastErr,
+		meanError = sum / count,
+		maxError = maxErr,
+	}
+end
+
+
+-- ============================================================================
+-- 2. ReplicatedStorage/RoleVisualsController (ModuleScript)
+-- ============================================================================
+export type RoleName = "Innocent" | "Sheriff" | "Hero" | "Murderer"
+export type RoleOrUnknown = RoleName | "Unknown"
+export type RoundPhase = "Idle" | "Preparation" | "ActiveRound"
+
+local ROLE_COLORS: { [RoleOrUnknown]: Color3 } = {
+	Innocent = Color3.fromRGB(70, 235, 120),
+	Sheriff = Color3.fromRGB(75, 155, 255),
+	Hero = Color3.fromRGB(255, 220, 75),
+	Murderer = Color3.fromRGB(255, 75, 85),
+	Unknown = Color3.fromRGB(165, 175, 190),
+}
+
+local HIGHLIGHT_NAME = "RoleVisualHighlight_Debug"
+
+local RoleVisualsController = {}
+RoleVisualsController.__index = RoleVisualsController
+
+function RoleVisualsController.new(): any
+	local self = {
+		enabled = false,
+		roundActive = false,
+		phase = "Idle" :: RoundPhase,
+		fillTransparency = 0.55,
+		outlineTransparency = 0.05,
+		roleByTargetId = {} :: { [string]: RoleName },
+		highlightsByModel = {} :: { [Model]: Highlight },
+	}
+	return setmetatable(self, RoleVisualsController)
+end
+
+function RoleVisualsController:GetRoleColor(role: RoleOrUnknown): Color3
+	return ROLE_COLORS[role] or ROLE_COLORS.Unknown
+end
+
+function RoleVisualsController:SetRoleColor(role: RoleOrUnknown, color: Color3)
+	ROLE_COLORS[role] = color
+	self:RefreshColors()
+end
+
+function RoleVisualsController:SetTransparencies(fillTransp: number, outlineTransp: number)
+	self.fillTransparency = math.clamp(fillTransp, 0, 1)
+	self.outlineTransparency = math.clamp(outlineTransp, 0, 1)
+	self:RefreshColors()
+end
+
+function RoleVisualsController:GetRole(targetId: string): RoleOrUnknown
+	return self.roleByTargetId[targetId] or "Unknown"
+end
+
+function RoleVisualsController:SetEnabled(enabled: boolean)
+	self.enabled = enabled == true
+	self:RefreshAll()
+end
+
+function RoleVisualsController:IsEnabled(): boolean
+	return self.enabled
+end
+
+function RoleVisualsController:SetRoundState(active: boolean, phase: RoundPhase)
+	self.roundActive = active == true
+	self.phase = phase
+	if phase == "Idle" or not self.roundActive then
+		self:ClearAllHighlights()
+	else
+		self:RefreshAll()
+	end
+end
+
+function RoleVisualsController:AssignRole(targetId: string, role: RoleName?)
+	if role == nil then
+		self.roleByTargetId[targetId] = nil
+	else
+		self.roleByTargetId[targetId] = role
+	end
+	self:RefreshColors()
+end
+
+function RoleVisualsController:AssignRolesBulk(rolesMap: { [string]: RoleName }, replaceExisting: boolean?)
+	if replaceExisting then
+		table.clear(self.roleByTargetId)
+	end
+	for targetId, role in pairs(rolesMap) do
+		self.roleByTargetId[targetId] = role
+	end
+	self:RefreshColors()
+end
+
+function RoleVisualsController:ClearRoles()
+	table.clear(self.roleByTargetId)
+	self:RefreshColors()
+end
+
+function RoleVisualsController:ClearAllHighlights()
+	for model, hl in pairs(self.highlightsByModel) do
+		if hl and hl.Parent then
+			hl:Destroy()
+		elseif model and model.Parent then
+			local existing = model:FindFirstChild(HIGHLIGHT_NAME)
+			if existing then
+				existing:Destroy()
+			end
+		end
+		self.highlightsByModel[model] = nil
+	end
+end
+
+local function ensureHighlight(model: Model, fillT: number, outlineT: number): Highlight
+	local existing = model:FindFirstChild(HIGHLIGHT_NAME)
+	local hl: Highlight
+	if existing and existing:IsA("Highlight") then
+		hl = existing
+	else
+		hl = Instance.new("Highlight")
+		hl.Name = HIGHLIGHT_NAME
+		hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+		hl.Parent = model
+	end
+	hl.FillTransparency = fillT
+	hl.OutlineTransparency = outlineT
+	return hl
+end
+
+function RoleVisualsController:RefreshColors()
+	for model, hl in pairs(self.highlightsByModel) do
+		if not model.Parent or not hl.Parent then
+			self.highlightsByModel[model] = nil
+		else
+			local targetId = hl:GetAttribute("TargetId")
+			local role: RoleOrUnknown = if type(targetId) == "string" then self:GetRole(targetId) else "Unknown"
+			local col = self:GetRoleColor(role)
+			hl.FillColor = col
+			hl.OutlineColor = col
+			hl.FillTransparency = self.fillTransparency
+			hl.OutlineTransparency = self.outlineTransparency
+		end
+	end
+end
+
+function RoleVisualsController:SyncEntities(entities: { { id: string, model: Model } })
+	local shouldShow = self.enabled and self.roundActive and (self.phase == "Preparation" or self.phase == "ActiveRound")
+	if not shouldShow then
+		self:ClearAllHighlights()
+		return
+	end
+
+	local activeModels: { [Model]: boolean } = {}
+
+	for _, entry in ipairs(entities) do
+		local model = entry.model
+		if model and model.Parent then
+			activeModels[model] = true
+			local role = self:GetRole(entry.id)
+			local hl = ensureHighlight(model, self.fillTransparency, self.outlineTransparency)
+			local col = self:GetRoleColor(role)
+			hl:SetAttribute("TargetId", entry.id)
+			hl.FillColor = col
+			hl.OutlineColor = col
+			hl.Enabled = true
+			self.highlightsByModel[model] = hl
+		end
+	end
+
+	for model, hl in pairs(self.highlightsByModel) do
+		if not activeModels[model] then
+			if hl and hl.Parent then
+				hl:Destroy()
+			end
+			self.highlightsByModel[model] = nil
+		end
+	end
+end
+
+function RoleVisualsController:RefreshAll()
+	local shouldShow = self.enabled and self.roundActive and (self.phase == "Preparation" or self.phase == "ActiveRound")
+	if not shouldShow then
+		self:ClearAllHighlights()
+		return
+	end
+	self:RefreshColors()
+end
+
+
+-- ============================================================================
+-- 3. ReplicatedStorage/TargetSelector (ModuleScript)
+-- ============================================================================
+export type PriorityMode = "RoleFirst" | "WeightedScore"
+
+export type SelectorConfig = {
+	BaseFovRadiusPx: number,
+	ScaleFovByViewport: boolean,
+	CheckPredictedInFov: boolean,
+	RequireLineOfSight: boolean,
+	UsePredictedForRay: boolean,
+	MaxRayDistance: number,
+	PriorityMode: PriorityMode,
+	AllowedRoles: { [RoleOrUnknown]: boolean }?,
+	RoleWeights: { [RoleOrUnknown]: number },
+}
+
+export type CandidateInput = {
+	id: string,
+	model: Model,
+	part: BasePart,
+}
+
+export type CandidateResult = {
+	targetId: string,
+	role: RoleOrUnknown,
+	model: Model,
+	anchorPart: BasePart,
+	currentPos: Vector3,
+	predictedPos: Vector3,
+	predictedTime: number,
+	worldDistance: number,
+	screenPos: Vector3,
+	screenDistPx: number,
+	fovRadiusPx: number,
+	roleWeight: number,
+	score: number,
+	hasLineOfSight: boolean,
+	hitInstance: Instance?,
+}
+
+local TargetSelector = {}
+TargetSelector.__index = TargetSelector
+
+local function isValidPos(v: Vector3): boolean
+	return v.X == v.X and v.Y == v.Y and v.Z == v.Z
+		and math.abs(v.X) ~= math.huge and math.abs(v.Y) ~= math.huge and math.abs(v.Z) ~= math.huge
+end
+
+function TargetSelector.new(predictionEngine: any, roleVisuals: any?, customConfig: Partial<SelectorConfig>?): any
+	local config: SelectorConfig = {
+		BaseFovRadiusPx = 180,
+		ScaleFovByViewport = true,
+		CheckPredictedInFov = false,
+		RequireLineOfSight = true,
+		UsePredictedForRay = false,
+		MaxRayDistance = 250,
+		PriorityMode = "RoleFirst",
+		AllowedRoles = nil,
+		RoleWeights = {
+			Murderer = 4.0,
+			Sheriff = 3.0,
+			Hero = 3.0,
+			Innocent = 1.0,
+			Unknown = 0.5,
+		},
+	}
+
+	local self = {
+		engine = predictionEngine,
+		roleVisuals = roleVisuals,
+		config = config,
+		rayParams = RaycastParams.new(),
+	}
+
+	self.rayParams.FilterType = Enum.RaycastFilterType.Exclude
+	self.rayParams.IgnoreWater = true
+
+	setmetatable(self, TargetSelector)
+
+	if customConfig then
+		self:SetConfig(customConfig)
+	end
+
+	return self
+end
+
+function TargetSelector:SetConfig(partial: Partial<SelectorConfig>)
+	for k, v in pairs(partial) do
+		if k == "RoleWeights" and type(v) == "table" then
+			for roleKey, weightVal in pairs(v) do
+				if type(weightVal) == "number" and weightVal == weightVal and math.abs(weightVal) ~= math.huge then
+					self.config.RoleWeights[roleKey] = weightVal
+				end
+			end
+		else
+			(self.config :: any)[k] = v
+		end
+	end
+end
+
+function TargetSelector:GetTargetRole(targetId: string): RoleOrUnknown
+	if self.roleVisuals and type(self.roleVisuals.GetRole) == "function" then
+		return self.roleVisuals:GetRole(targetId)
+	end
+	return "Unknown"
+end
+
+function TargetSelector:IsRoleAllowed(role: RoleOrUnknown): boolean
+	local allowed = self.config.AllowedRoles
+	if not allowed then
+		return true
+	end
+	return allowed[role] == true
+end
+
+function TargetSelector:GetEffectiveFovRadius(camera: Camera): number
+	local cfg: SelectorConfig = self.config
+	local baseRadius = math.max(10, cfg.BaseFovRadiusPx)
+	local viewportY = camera.ViewportSize.Y
+	if viewportY <= 0 then
+		return baseRadius
+	end
+	if cfg.ScaleFovByViewport then
+		return baseRadius * (viewportY / 1080)
+	end
+	return baseRadius
+end
+
+function TargetSelector:IsPointInFov(
+	camera: Camera,
+	worldPos: Vector3,
+	refScreenPoint: Vector2,
+	fovRadiusPx: number
+): (boolean, Vector3, number)
+	local screenPos, onScreen = camera:WorldToScreenPoint(worldPos)
+	if not onScreen or screenPos.Z <= 0 then
+		return false, screenPos, math.huge
+	end
+
+	local point2D = Vector2.new(screenPos.X, screenPos.Y)
+	local distPx = (point2D - refScreenPoint).Magnitude
+	return distPx <= fovRadiusPx, screenPos, distPx
+end
+
+function TargetSelector:CheckLineOfSight(
+	originPos: Vector3,
+	goalPos: Vector3,
+	localCharacter: Model?,
+	targetModel: Model
+): (boolean, Instance?)
+	local delta = goalPos - originPos
+	local dist = delta.Magnitude
+	if dist <= 1e-4 then
+		return true, nil
+	end
+
+	local filterList: { Instance } = {}
+	if localCharacter and localCharacter.Parent then
+		table.insert(filterList, localCharacter)
+	end
+	self.rayParams.FilterDescendantsInstances = filterList
+
+	local result = workspace:Raycast(originPos, delta, self.rayParams)
+	if not result then
+		return true, nil
+	end
+
+	if result.Instance:IsDescendantOf(targetModel) then
+		return true, result.Instance
+	end
+
+	return false, result.Instance
+end
+
+local function isBetterCandidate(mode: PriorityMode, candidate: CandidateResult, currentBest: CandidateResult?): boolean
+	if currentBest == nil then
+		return true
+	end
+	if mode == "RoleFirst" then
+		if candidate.roleWeight ~= currentBest.roleWeight then
+			return candidate.roleWeight > currentBest.roleWeight
+		end
+		return candidate.screenDistPx < currentBest.screenDistPx
+	end
+	return candidate.score > currentBest.score
+end
+
+local function isAliveHumanoidModel(model: Model): boolean
+	local hum = model:FindFirstChildOfClass("Humanoid")
+	if not hum then
+		return true
+	end
+	return hum.Health > 0
+end
+
+function TargetSelector:SelectBestTarget(
+	camera: Camera,
+	originPos: Vector3,
+	refScreenPoint: Vector2,
+	candidates: { CandidateInput },
+	localCharacter: Model?,
+	now: number?
+): CandidateResult?
+	if not isValidPos(originPos) then
+		return nil
+	end
+
+	local t = if type(now) == "number" and now == now then now else os.clock()
+	local cfg: SelectorConfig = self.config
+	local fovRadius = self:GetEffectiveFovRadius(camera)
+	local best: CandidateResult? = nil
+
+	for _, item in ipairs(candidates) do
+		local model = item.model
+		local part = item.part
+		if model and model.Parent and part and part.Parent and isAliveHumanoidModel(model) then
+			local currentPos = part.Position
+			if isValidPos(currentPos) then
+				local role = self:GetTargetRole(item.id)
+				if self:IsRoleAllowed(role) then
+					local worldDist = (currentPos - originPos).Magnitude
+					if worldDist <= cfg.MaxRayDistance then
+						local inFovCurrent, screenPos, distPx = self:IsPointInFov(
+							camera,
+							currentPos,
+							refScreenPoint,
+							fovRadius
+						)
+
+						if inFovCurrent then
+							local predPos, predTime, _, predInfo = self.engine:Predict(item.id, originPos, currentPos, t)
+							if not isValidPos(predPos) then
+								predPos = currentPos
+							end
+
+							local inFovPred = true
+							if cfg.CheckPredictedInFov then
+								inFovPred = self:IsPointInFov(camera, predPos, refScreenPoint, fovRadius)
+							end
+
+							if inFovPred then
+								local rayGoal = if cfg.UsePredictedForRay then predPos else currentPos
+								local losOk, hitInst = self:CheckLineOfSight(originPos, rayGoal, localCharacter, model)
+								if (not cfg.RequireLineOfSight) or losOk then
+									local weight = cfg.RoleWeights[role] or 1.0
+									local proximity = math.clamp(1 - (distPx / math.max(fovRadius, 1)), 0, 1)
+									local speedBonus = math.clamp(predInfo.velocity.Magnitude / 40, 0, 0.25)
+									local combinedScore = weight * (0.4 + 0.6 * proximity + speedBonus)
+
+									local candidate: CandidateResult = {
+										targetId = item.id,
+										role = role,
+										model = model,
+										anchorPart = part,
+										currentPos = currentPos,
+										predictedPos = predPos,
+										predictedTime = predTime,
+										worldDistance = worldDist,
+										screenPos = screenPos,
+										screenDistPx = distPx,
+										fovRadiusPx = fovRadius,
+										roleWeight = weight,
+										score = combinedScore,
+										hasLineOfSight = losOk,
+										hitInstance = hitInst,
+									}
+
+									if isBetterCandidate(cfg.PriorityMode, candidate, best) then
+										best = candidate
+									end
+								end
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+
+	return best
+end
+
+
+-- ============================================================================
+-- 4. ReplicatedStorage/SilentAimController (ModuleScript)
+-- ============================================================================
+export type AimResult = {
+	hasTarget: boolean,
+	currentPos: Vector3,
+	aimPoint: Vector3,
+	direction: Vector3,
+	offsetStuds: number,
+	worldDistance: number,
+	targetId: string?,
+	targetModel: Model?,
+	role: RoleOrUnknown?,
+	predictedTime: number,
+	screenDistPx: number,
+	fovRadiusPx: number,
+	demoMode: boolean,
+}
+
+local SilentAimController = {}
+SilentAimController.__index = SilentAimController
+
+function SilentAimController.new(targetSelector: any): any
+	local self = {
+		selector = targetSelector,
+		enabled = true,
+		demoMode = true,
+	}
+	return setmetatable(self, SilentAimController)
+end
+
+function SilentAimController:SetEnabled(state: boolean)
+	self.enabled = state == true
+end
+
+function SilentAimController:IsEnabled(): boolean
+	return self.enabled
+end
+
+function SilentAimController:SetDemoMode(state: boolean)
+	self.demoMode = state == true
+end
+
+function SilentAimController:IsDemoMode(): boolean
+	return self.demoMode
+end
+
+function SilentAimController:ResolveAim(
+	camera: Camera,
+	originPos: Vector3,
+	fallbackDirection: Vector3,
+	refScreenPoint: Vector2,
+	candidates: { { id: string, model: Model, part: BasePart } },
+	localCharacter: Model?,
+	now: number?
+): AimResult
+	local safeFallbackDir = if fallbackDirection.Magnitude > 1e-5
+		then fallbackDirection.Unit
+		else camera.CFrame.LookVector
+
+	local fovRadius = self.selector:GetEffectiveFovRadius(camera)
+	local fallbackPoint = originPos + safeFallbackDir * 100
+
+	if not self.enabled then
+		return {
+			hasTarget = false,
+			currentPos = fallbackPoint,
+			aimPoint = fallbackPoint,
+			direction = safeFallbackDir,
+			offsetStuds = 0,
+			worldDistance = 100,
+			targetId = nil,
+			targetModel = nil,
+			role = nil,
+			predictedTime = 0,
+			screenDistPx = math.huge,
+			fovRadiusPx = fovRadius,
+			demoMode = self.demoMode,
+		}
+	end
+
+	local best = self.selector:SelectBestTarget(
+		camera,
+		originPos,
+		refScreenPoint,
+		candidates,
+		localCharacter,
+		now
+	)
+
+	if best then
+		local delta = best.predictedPos - originPos
+		local dir = if delta.Magnitude > 1e-4 then delta.Unit else safeFallbackDir
+		return {
+			hasTarget = true,
+			currentPos = best.currentPos,
+			aimPoint = best.predictedPos,
+			direction = dir,
+			offsetStuds = (best.predictedPos - best.currentPos).Magnitude,
+			worldDistance = best.worldDistance,
+			targetId = best.targetId,
+			targetModel = best.model,
+			role = best.role,
+			predictedTime = best.predictedTime,
+			screenDistPx = best.screenDistPx,
+			fovRadiusPx = best.fovRadiusPx,
+			demoMode = self.demoMode,
+		}
+	end
+
+	return {
+		hasTarget = false,
+		currentPos = fallbackPoint,
+		aimPoint = fallbackPoint,
+		direction = safeFallbackDir,
+		offsetStuds = 0,
+		worldDistance = 100,
+		targetId = nil,
+		targetModel = nil,
+		role = nil,
+		predictedTime = 0,
+		screenDistPx = math.huge,
+		fovRadiusPx = fovRadius,
+		demoMode = self.demoMode,
+	}
+end
+
+
+-- ============================================================================
+-- 5. ReplicatedStorage/SettingsManager (ModuleScript)
+-- ============================================================================
+export type AxisWeightsData = {
+	X: number,
+	Y: number,
+	Z: number,
+}
+
+export type SuiteSettings = {
+	AutoPrediction: boolean,
+	PredictionStrength: number,
+	AxisWeights: AxisWeightsData,
+	DynamicPrediction: boolean,
+	PingCompensation: boolean,
+	PingSeconds: number,
+	ProjectileSpeed: number,
+	MaxPredictionTime: number,
+	BaseFovRadiusPx: number,
+	ScaleFovByViewport: boolean,
+	RequireLineOfSight: boolean,
+	VisualsEnabled: boolean,
+	SilentAimEnabled: boolean,
+	DemoModeEnabled: boolean,
+}
+
+type SettingsListener = (settings: SuiteSettings, changedKey: string?) -> ()
+
+local SettingsManager = {}
+SettingsManager.__index = SettingsManager
+
+local function isFiniteNum(n: unknown): boolean
+	return type(n) == "number" and n == n and math.abs(n) ~= math.huge
+end
+
+local function clampNum(val: unknown, fallback: number, minV: number, maxV: number): number
+	if not isFiniteNum(val) then
+		return fallback
+	end
+	return math.clamp(val :: number, minV, maxV)
+end
+
+function SettingsManager.GetDefaultSettings(): SuiteSettings
+	return {
+		AutoPrediction = true,
+		PredictionStrength = 1.0,
+		AxisWeights = { X = 1.0, Y = 0.65, Z = 1.0 },
+		DynamicPrediction = true,
+		PingCompensation = true,
+		PingSeconds = 0.06,
+		ProjectileSpeed = 135,
+		MaxPredictionTime = 0.85,
+		BaseFovRadiusPx = 185,
+		ScaleFovByViewport = true,
+		RequireLineOfSight = true,
+		VisualsEnabled = true,
+		SilentAimEnabled = true,
+		DemoModeEnabled = true,
+	}
+end
+
+function SettingsManager.CloneSettings(src: SuiteSettings): SuiteSettings
+	return {
+		AutoPrediction = src.AutoPrediction == true,
+		PredictionStrength = clampNum(src.PredictionStrength, 1.0, 0, 5),
+		AxisWeights = {
+			X = clampNum(src.AxisWeights.X, 1.0, -5, 5),
+			Y = clampNum(src.AxisWeights.Y, 0.65, -5, 5),
+			Z = clampNum(src.AxisWeights.Z, 1.0, -5, 5),
+		},
+		DynamicPrediction = src.DynamicPrediction == true,
+		PingCompensation = src.PingCompensation == true,
+		PingSeconds = clampNum(src.PingSeconds, 0.06, 0, 2.0),
+		ProjectileSpeed = clampNum(src.ProjectileSpeed, 135, 0, 5000),
+		MaxPredictionTime = clampNum(src.MaxPredictionTime, 0.85, 0.01, 5.0),
+		BaseFovRadiusPx = clampNum(src.BaseFovRadiusPx, 185, 10, 800),
+		ScaleFovByViewport = src.ScaleFovByViewport == true,
+		RequireLineOfSight = src.RequireLineOfSight == true,
+		VisualsEnabled = src.VisualsEnabled == true,
+		SilentAimEnabled = src.SilentAimEnabled == true,
+		DemoModeEnabled = src.DemoModeEnabled == true,
+	}
+end
+
+function SettingsManager.new(initial: Partial<SuiteSettings>?): any
+	local current = SettingsManager.GetDefaultSettings()
+	local self = {
+		current = current,
+		listeners = {} :: { [number]: SettingsListener },
+		nextListenerId = 1,
+	}
+	setmetatable(self, SettingsManager)
+
+	if initial then
+		self:Update(initial)
+	end
+
+	return self
+end
+
+function SettingsManager:Get(): SuiteSettings
+	return SettingsManager.CloneSettings(self.current)
+end
+
+function SettingsManager:Subscribe(callback: SettingsListener): () -> ()
+	local id = self.nextListenerId
+	self.nextListenerId += 1
+	self.listeners[id] = callback
+
+	return function()
+		self.listeners[id] = nil
+	end
+end
+
+function SettingsManager:Emit(changedKey: string?)
+	local snapshot = self:Get()
+	for _, fn in pairs(self.listeners) do
+		fn(snapshot, changedKey)
+	end
+end
+
+function SettingsManager:SetValue(key: string, value: unknown)
+	local c = self.current
+
+	if key == "AutoPrediction" and type(value) == "boolean" then
+		c.AutoPrediction = value
+	elseif key == "PredictionStrength" then
+		c.PredictionStrength = clampNum(value, c.PredictionStrength, 0, 5)
+	elseif key == "DynamicPrediction" and type(value) == "boolean" then
+		c.DynamicPrediction = value
+	elseif key == "PingCompensation" and type(value) == "boolean" then
+		c.PingCompensation = value
+	elseif key == "PingSeconds" then
+		c.PingSeconds = clampNum(value, c.PingSeconds, 0, 2.0)
+	elseif key == "ProjectileSpeed" then
+		c.ProjectileSpeed = clampNum(value, c.ProjectileSpeed, 0, 5000)
+	elseif key == "MaxPredictionTime" then
+		c.MaxPredictionTime = clampNum(value, c.MaxPredictionTime, 0.01, 5.0)
+	elseif key == "BaseFovRadiusPx" then
+		c.BaseFovRadiusPx = clampNum(value, c.BaseFovRadiusPx, 10, 800)
+	elseif key == "ScaleFovByViewport" and type(value) == "boolean" then
+		c.ScaleFovByViewport = value
+	elseif key == "RequireLineOfSight" and type(value) == "boolean" then
+		c.RequireLineOfSight = value
+	elseif key == "VisualsEnabled" and type(value) == "boolean" then
+		c.VisualsEnabled = value
+	elseif key == "SilentAimEnabled" and type(value) == "boolean" then
+		c.SilentAimEnabled = value
+	elseif key == "DemoModeEnabled" and type(value) == "boolean" then
+		c.DemoModeEnabled = value
+	elseif key == "AxisX" then
+		c.AxisWeights.X = clampNum(value, c.AxisWeights.X, -5, 5)
+	elseif key == "AxisY" then
+		c.AxisWeights.Y = clampNum(value, c.AxisWeights.Y, -5, 5)
+	elseif key == "AxisZ" then
+		c.AxisWeights.Z = clampNum(value, c.AxisWeights.Z, -5, 5)
+	else
+		return
+	end
+
+	self:Emit(key)
+end
+
+function SettingsManager:Update(partial: Partial<SuiteSettings>)
+	for k, v in pairs(partial) do
+		if k == "AxisWeights" and type(v) == "table" then
+			if v.X ~= nil then
+				self.current.AxisWeights.X = clampNum(v.X, self.current.AxisWeights.X, -5, 5)
+			end
+			if v.Y ~= nil then
+				self.current.AxisWeights.Y = clampNum(v.Y, self.current.AxisWeights.Y, -5, 5)
+			end
+			if v.Z ~= nil then
+				self.current.AxisWeights.Z = clampNum(v.Z, self.current.AxisWeights.Z, -5, 5)
+			end
+		else
+			self:SetValue(k, v)
+		end
+	end
+	self:Emit("BulkUpdate")
+end
+
+function SettingsManager:ResetToDefault()
+	self.current = SettingsManager.GetDefaultSettings()
+	self:Emit("Reset")
+end
+
+
+-- ============================================================================
+-- 6. ReplicatedStorage/ProfileManager (ModuleScript)
+-- ============================================================================
+export type ProfileEntry = {
+	name: string,
+	description: string,
+	builtIn: boolean,
+	settings: SuiteSettings,
+}
+
+local ProfileManager = {}
+ProfileManager.__index = ProfileManager
+
+local function buildDefaultProfiles(): { [string]: ProfileEntry }
+	return {
+		["Balanced_Test"] = {
+			name = "Balanced_Test",
+			description = "Perfil equilibrado para pruebas generales en entorno privado",
+			builtIn = true,
+			settings = {
+				AutoPrediction = true,
+				PredictionStrength = 1.0,
+				AxisWeights = { X = 1.0, Y = 0.65, Z = 1.0 },
+				DynamicPrediction = true,
+				PingCompensation = true,
+				PingSeconds = 0.06,
+				ProjectileSpeed = 135,
+				MaxPredictionTime = 0.85,
+				BaseFovRadiusPx = 185,
+				ScaleFovByViewport = true,
+				RequireLineOfSight = true,
+				VisualsEnabled = true,
+				SilentAimEnabled = true,
+				DemoModeEnabled = true,
+			},
+		},
+		["Sheriff_FastShot"] = {
+			name = "Sheriff_FastShot",
+			description = "Alta velocidad de disparo / menor compensación de trayectoria",
+			builtIn = true,
+			settings = {
+				AutoPrediction = true,
+				PredictionStrength = 0.85,
+				AxisWeights = { X = 1.0, Y = 0.5, Z = 1.0 },
+				DynamicPrediction = true,
+				PingCompensation = true,
+				PingSeconds = 0.05,
+				ProjectileSpeed = 320,
+				MaxPredictionTime = 0.45,
+				BaseFovRadiusPx = 150,
+				ScaleFovByViewport = true,
+				RequireLineOfSight = true,
+				VisualsEnabled = true,
+				SilentAimEnabled = true,
+				DemoModeEnabled = true,
+			},
+		},
+		["Knife_ThrowArc"] = {
+			name = "Knife_ThrowArc",
+			description = "Simulación de lanzamiento con tiempo de vuelo apreciable",
+			builtIn = true,
+			settings = {
+				AutoPrediction = true,
+				PredictionStrength = 1.15,
+				AxisWeights = { X = 1.05, Y = 0.75, Z = 1.05 },
+				DynamicPrediction = true,
+				PingCompensation = true,
+				PingSeconds = 0.08,
+				ProjectileSpeed = 105,
+				MaxPredictionTime = 1.1,
+				BaseFovRadiusPx = 210,
+				ScaleFovByViewport = true,
+				RequireLineOfSight = true,
+				VisualsEnabled = true,
+				SilentAimEnabled = true,
+				DemoModeEnabled = true,
+			},
+		},
+	}
+end
+
+function ProfileManager.new(settingsManager: any): any
+	local self = {
+		settingsManager = settingsManager,
+		profiles = buildDefaultProfiles(),
+		activeProfileName = "Balanced_Test",
+	}
+	return setmetatable(self, ProfileManager)
+end
+
+function ProfileManager:GetActiveProfileName(): string
+	return self.activeProfileName
+end
+
+function ProfileManager:ListProfileNames(): { string }
+	local names: { string } = {}
+	for name, _ in pairs(self.profiles) do
+		table.insert(names, name)
+	end
+	table.sort(names)
+	return names
+end
+
+function ProfileManager:GetProfile(name: string): ProfileEntry?
+	local entry = self.profiles[name]
+	if not entry then
+		return nil
+	end
+	return {
+		name = entry.name,
+		description = entry.description,
+		builtIn = entry.builtIn,
+		settings = SettingsManager.CloneSettings(entry.settings),
+	}
+end
+
+function ProfileManager:SaveProfile(name: string, description: string?): boolean
+	if type(name) ~= "string" or string.match(name, "^%s*$") or not self.settingsManager then
+		return false
+	end
+	local existing = self.profiles[name]
+	local builtInFlag = if existing then existing.builtIn else false
+	self.profiles[name] = {
+		name = name,
+		description = if type(description) == "string" and description ~= ""
+			then description
+			else (if existing then existing.description else "Perfil personalizado de prueba"),
+		builtIn = builtInFlag,
+		settings = SettingsManager.CloneSettings(self.settingsManager:Get()),
+	}
+	self.activeProfileName = name
+	return true
+end
+
+function ProfileManager:LoadProfile(name: string): boolean
+	local entry = self.profiles[name]
+	if not entry or not self.settingsManager then
+		return false
+	end
+	self.settingsManager:Update(SettingsManager.CloneSettings(entry.settings))
+	self.activeProfileName = name
+	return true
+end
+
+function ProfileManager:DeleteProfile(name: string): boolean
+	local entry = self.profiles[name]
+	if not entry or entry.builtIn then
+		return false
+	end
+	self.profiles[name] = nil
+	if self.activeProfileName == name then
+		self.activeProfileName = "Balanced_Test"
+		self:LoadProfile("Balanced_Test")
+	end
+	return true
+end
+
+
+-- ============================================================================
+-- 7. ReplicatedStorage/TelemetryController (ModuleScript)
+-- ============================================================================
+export type TelemetrySample = {
+	id: number,
+	targetId: string,
+	errorStuds: number,
+	predictedTime: number,
+	distanceStuds: number,
+	speedStudsPerSec: number,
+	simulated: boolean,
+	timestamp: number,
+}
+
+export type TelemetryStats = {
+	count: number,
+	lastError: number?,
+	meanError: number?,
+	maxError: number?,
+	minError: number?,
+}
+
+local TelemetryController = {}
+TelemetryController.__index = TelemetryController
+
+function TelemetryController.new(maxSamples: number?): any
+	local limit = if type(maxSamples) == "number" and maxSamples >= 10 then math.floor(maxSamples) else 1000
+	local self = {
+		samples = {} :: { TelemetrySample },
+		maxSamples = limit,
+		nextId = 1,
+	}
+	return setmetatable(self, TelemetryController)
+end
+
+function TelemetryController:Record(entry: {
+	targetId: string,
+	errorStuds: number,
+	predictedTime: number?,
+	distanceStuds: number?,
+	speedStudsPerSec: number?,
+	simulated: boolean?,
+	timestamp: number?,
+}): TelemetrySample?
+	local err = entry.errorStuds
+	if type(err) ~= "number" or err ~= err or math.abs(err) == math.huge or err < 0 then
+		return nil
+	end
+
+	local sample: TelemetrySample = {
+		id = self.nextId,
+		targetId = tostring(entry.targetId),
+		errorStuds = err,
+		predictedTime = if type(entry.predictedTime) == "number" then math.max(0, entry.predictedTime) else 0,
+		distanceStuds = if type(entry.distanceStuds) == "number" then math.max(0, entry.distanceStuds) else 0,
+		speedStudsPerSec = if type(entry.speedStudsPerSec) == "number" then math.max(0, entry.speedStudsPerSec) else 0,
+		simulated = if entry.simulated == nil then false else entry.simulated == true,
+		timestamp = if type(entry.timestamp) == "number" then entry.timestamp else os.clock(),
+	}
+
+	self.nextId += 1
+	table.insert(self.samples, sample)
+	if #self.samples > self.maxSamples then
+		table.remove(self.samples, 1)
+	end
+
+	return sample
+end
+
+function TelemetryController:Clear()
+	table.clear(self.samples)
+end
+
+function TelemetryController:GetHistory(options: {
+	targetId: string?,
+	simulated: boolean?,
+	windowSeconds: number?,
+	now: number?,
+}?): { TelemetrySample }
+	local opts = options or {}
+	local tNow = if type(opts.now) == "number" then opts.now else os.clock()
+	local minTime: number? = if type(opts.windowSeconds) == "number" and opts.windowSeconds > 0
+		then (tNow - opts.windowSeconds)
+		else nil
+
+	local result: { TelemetrySample } = {}
+	for _, s in ipairs(self.samples) do
+		local okId = (opts.targetId == nil or s.targetId == opts.targetId)
+		local okSim = (opts.simulated == nil or s.simulated == opts.simulated)
+		local okTime = (minTime == nil or s.timestamp >= minTime)
+		if okId and okSim and okTime then
+			table.insert(result, s)
+		end
+	end
+	return result
+end
+
+function TelemetryController:ComputeStats(options: {
+	targetId: string?,
+	simulated: boolean?,
+	windowSeconds: number?,
+	now: number?,
+}?): TelemetryStats
+	local list = self:GetHistory(options)
+	local count = #list
+	if count == 0 then
+		return { count = 0, lastError = nil, meanError = nil, maxError = nil, minError = nil }
+	end
+
+	local sum = 0
+	local minErr = list[1].errorStuds
+	local maxErr = list[1].errorStuds
+	local lastErr = list[count].errorStuds
+
+	for _, s in ipairs(list) do
+		sum += s.errorStuds
+		if s.errorStuds < minErr then
+			minErr = s.errorStuds
+		end
+		if s.errorStuds > maxErr then
+			maxErr = s.errorStuds
+		end
+		lastErr = s.errorStuds
+	end
+
+	return {
+		count = count,
+		lastError = lastErr,
+		meanError = sum / count,
+		maxError = maxErr,
+		minError = minErr,
+	}
+end
+
+
+-- ============================================================================
+-- 8. ReplicatedStorage/PerformanceMonitor (ModuleScript)
+-- ============================================================================
+local StatsService = game:GetService("Stats")
+
+export type PerfSnapshot = {
+	fps: number,
+	frameTimeMs: number,
+	pingMs: number,
+	memoryMb: number,
+}
+
+local PerformanceMonitor = {}
+PerformanceMonitor.__index = PerformanceMonitor
+
+function PerformanceMonitor.new(smoothingAlpha: number?): any
+	local alpha = if type(smoothingAlpha) == "number" then math.clamp(smoothingAlpha, 0.02, 1.0) else 0.12
+	local self = {
+		alpha = alpha,
+		smoothFps = 60,
+		smoothFrameMs = 16.67,
+		lastSampleTime = 0,
+		cachedPingMs = 0,
+		cachedMemMb = 0,
+	}
+	return setmetatable(self, PerformanceMonitor)
+end
+
+function PerformanceMonitor:Step(dt: number, now: number?): PerfSnapshot
+	local safeDt = if type(dt) == "number" and dt > 1e-5 and dt < 1.0 then dt else (1 / 60)
+	local instFps = 1 / safeDt
+	local instMs = safeDt * 1000
+
+	self.smoothFps = self.smoothFps + (instFps - self.smoothFps) * self.alpha
+	self.smoothFrameMs = self.smoothFrameMs + (instMs - self.smoothFrameMs) * self.alpha
+
+	local t = if type(now) == "number" then now else os.clock()
+	if t - self.lastSampleTime >= 0.5 then
+		self.lastSampleTime = t
+		local okPing, pingItem = pcall(function()
+			return StatsService.Network.ServerStatsItem["Data Ping"]:GetValue()
+		end)
+		if okPing and type(pingItem) == "number" and pingItem == pingItem then
+			self.cachedPingMs = math.max(0, pingItem)
+		end
+
+		local okMem, memVal = pcall(function()
+			return StatsService:GetTotalMemoryUsageMb()
+		end)
+		if okMem and type(memVal) == "number" and memVal == memVal then
+			self.cachedMemMb = math.max(0, memVal)
+		end
+	end
+
+	return {
+		fps = self.smoothFps,
+		frameTimeMs = self.smoothFrameMs,
+		pingMs = self.cachedPingMs,
+		memoryMb = self.cachedMemMb,
+	}
+end
+
+
+-- ============================================================================
+-- 9. ReplicatedStorage/EntityManager (ModuleScript)
+-- ============================================================================
+export type TrackedEntity = {
+	id: string,
+	model: Model,
+	anchorPart: BasePart,
+	isDummy: boolean,
+}
+
+local EntityManager = {}
+EntityManager.__index = EntityManager
+
+function EntityManager.new(localPlayer: Player): any
+	local self = {
+		localPlayer = localPlayer,
+		entities = {} :: { TrackedEntity },
+	}
+	return setmetatable(self, EntityManager)
+end
+
+local function resolveAnchorPart(model: Model): BasePart?
+	local hrp = model:FindFirstChild("HumanoidRootPart")
+	if hrp and hrp:IsA("BasePart") then
+		return hrp
+	end
+	if model.PrimaryPart then
+		return model.PrimaryPart
+	end
+	for _, d in ipairs(model:GetDescendants()) do
+		if d:IsA("BasePart") then
+			return d
+		end
+	end
+	return nil
+end
+
+local function isAlive(model: Model): boolean
+	local hum = model:FindFirstChildOfClass("Humanoid")
+	if not hum then
+		return true
+	end
+	return hum.Health > 0
+end
+
+function EntityManager:Refresh(includeLocalCharacter: boolean?): { TrackedEntity }
+	table.clear(self.entities)
+	local localChar = self.localPlayer.Character
+
+	if includeLocalCharacter and localChar and localChar.Parent and isAlive(localChar) then
+		local anchor = resolveAnchorPart(localChar)
+		if anchor then
+			table.insert(self.entities, {
+				id = self.localPlayer.Name,
+				model = localChar,
+				anchorPart = anchor,
+				isDummy = false,
+			})
+		end
+	end
+
+	for _, child in ipairs(workspace:GetChildren()) do
+		if child:IsA("Model") and child ~= localChar and child.Parent and isAlive(child) then
+			local hum = child:FindFirstChildOfClass("Humanoid")
+			local isPlayerChar = false
+			if hum then
+				for _, plr in ipairs(game:GetService("Players"):GetPlayers()) do
+					if plr.Character == child then
+						isPlayerChar = true
+						break
+					end
+				end
+			end
+
+			local anchor = resolveAnchorPart(child)
+			if anchor then
+				table.insert(self.entities, {
+					id = child.Name,
+					model = child,
+					anchorPart = anchor,
+					isDummy = not isPlayerChar,
+				})
+			end
+		end
+	end
+
+	return self.entities
+end
+
+function EntityManager:GetEntities(): { TrackedEntity }
+	return self.entities
+end
+
+function EntityManager:GetSelectorCandidates(): { { id: string, model: Model, part: BasePart } }
+	local out = {}
+	for _, ent in ipairs(self.entities) do
+		table.insert(out, {
+			id = ent.id,
+			model = ent.model,
+			part = ent.anchorPart,
+		})
+	end
+	return out
+end
+
+function EntityManager:GetVisualEntities(): { { id: string, model: Model } }
+	local out = {}
+	for _, ent in ipairs(self.entities) do
+		table.insert(out, {
+			id = ent.id,
+			model = ent.model,
+		})
+	end
+	return out
+end
+
+
+-- ============================================================================
+-- 10. ReplicatedStorage/DebugController (ModuleScript)
+-- ============================================================================
+export type DebugLogEntry = {
+	level: "INFO" | "WARN" | "ERROR",
+	message: string,
+	timestamp: number,
+}
+
+local DebugController = {}
+DebugController.__index = DebugController
+
+function DebugController.new(maxLogs: number?): any
+	local limit = if type(maxLogs) == "number" and maxLogs >= 10 then math.floor(maxLogs) else 120
+	local self = {
+		logs = {} :: { DebugLogEntry },
+		maxLogs = limit,
+		markerPart = nil :: Part?,
+		beamPart = nil :: Part?,
+	}
+	return setmetatable(self, DebugController)
+end
+
+function DebugController:Log(level: "INFO" | "WARN" | "ERROR", message: string, now: number?): DebugLogEntry
+	local entry: DebugLogEntry = {
+		level = level,
+		message = tostring(message),
+		timestamp = if type(now) == "number" then now else os.clock(),
+	}
+	table.insert(self.logs, entry)
+	if #self.logs > self.maxLogs then
+		table.remove(self.logs, 1)
+	end
+	return entry
+end
+
+function DebugController:GetRecentLogs(count: number?): { DebugLogEntry }
+	local n = if type(count) == "number" and count > 0 then math.min(count, #self.logs) else #self.logs
+	local out: { DebugLogEntry } = {}
+	local startIdx = math.max(1, #self.logs - n + 1)
+	for i = startIdx, #self.logs do
+		table.insert(out, self.logs[i])
+	end
+	return out
+end
+
+function DebugController:ClearLogs()
+	table.clear(self.logs)
+end
+
+local function ensureDebugPart(existing: Part?, name: string, color: Color3, shape: Enum.PartType): Part
+	if existing and existing.Parent then
+		existing.Color = color
+		return existing
+	end
+	local p = Instance.new("Part")
+	p.Name = name
+	p.Shape = shape
+	p.Material = Enum.Material.Neon
+	p.Color = color
+	p.Anchored = true
+	p.CanCollide = false
+	p.CastShadow = false
+	p.Size = Vector3.new(0.7, 0.7, 0.7)
+	p.Transparency = 1
+	p.Parent = workspace
+	return p
+end
+
+function DebugController:UpdatePredictedMarker(pos: Vector3?, color: Color3?, visible: boolean)
+	local p = ensureDebugPart(
+		self.markerPart,
+		"NovaHub_PredMarker",
+		color or Color3.fromRGB(130, 195, 255),
+		Enum.PartType.Ball
+	)
+	self.markerPart = p
+
+	if not visible or not pos then
+		p.Transparency = 1
+		return
+	end
+
+	p.Position = pos
+	p.Transparency = 0
+end
+
+function DebugController:UpdateAimLine(originPos: Vector3?, aimPoint: Vector3?, color: Color3?, visible: boolean)
+	local line = ensureDebugPart(
+		self.beamPart,
+		"NovaHub_AimLine",
+		color or Color3.fromRGB(145, 130, 255),
+		Enum.PartType.Block
+	)
+	self.beamPart = line
+
+	if not visible or not originPos or not aimPoint then
+		line.Transparency = 1
+		return
+	end
+
+	local delta = aimPoint - originPos
+	local dist = delta.Magnitude
+	if dist <= 0.05 then
+		line.Transparency = 1
+		return
+	end
+
+	line.Size = Vector3.new(0.12, 0.12, dist)
+	line.CFrame = CFrame.lookAt(originPos + delta * 0.5, aimPoint)
+	line.Transparency = 0.35
+end
+
+function DebugController:DestroyVisuals()
+	if self.markerPart then
+		self.markerPart:Destroy()
+		self.markerPart = nil
+	end
+	if self.beamPart then
+		self.beamPart:Destroy()
+		self.beamPart = nil
+	end
+end
+
+
+-- ============================================================================
+-- 11. ReplicatedStorage/SimulationController (ModuleScript)
+-- ============================================================================
+export type DummyPattern = "Linear" | "ZigZag" | "Jump"
+
+type ActiveDummyMotion = {
+	model: Model,
+	root: BasePart,
+	originCFrame: CFrame,
+	pattern: DummyPattern,
+	speed: number,
+	amplitude: number,
+	elapsed: number,
+}
+
+local SimulationController = {}
+SimulationController.__index = SimulationController
+
+function SimulationController.new(localPlayer: Player?): any
+	local self = {
+		localPlayer = localPlayer,
+		activeProjectiles = {} :: { RBXScriptConnection },
+		trackedMotions = {} :: { [string]: ActiveDummyMotion },
+	}
+	return setmetatable(self, SimulationController)
+end
+
+function SimulationController:SetDummyMotion(
+	id: string,
+	model: Model,
+	root: BasePart,
+	pattern: DummyPattern,
+	speed: number?,
+	amplitude: number?
+)
+	self.trackedMotions[id] = {
+		model = model,
+		root = root,
+		originCFrame = root.CFrame,
+		pattern = pattern,
+		speed = if type(speed) == "number" then speed else 14,
+		amplitude = if type(amplitude) == "number" then amplitude else 8,
+		elapsed = 0,
+	}
+end
+
+function SimulationController:ClearDummyMotions()
+	table.clear(self.trackedMotions)
+end
+
+function SimulationController:StepMotions(dt: number)
+	local safeDt = if type(dt) == "number" and dt > 0 and dt < 0.25 then dt else (1 / 60)
+
+	for id, motion in pairs(self.trackedMotions) do
+		if not motion.model.Parent or not motion.root.Parent then
+			self.trackedMotions[id] = nil
+		else
+			motion.elapsed += safeDt
+			local t = motion.elapsed
+			local basePos = motion.originCFrame.Position
+			local offset = Vector3.zero
+
+			if motion.pattern == "Linear" then
+				local travel = math.sin(t * (motion.speed / math.max(motion.amplitude, 1))) * motion.amplitude
+				offset = Vector3.new(travel, 0, 0)
+			elseif motion.pattern == "ZigZag" then
+				local x = math.sin(t * 2.2) * motion.amplitude
+				local z = math.cos(t * 1.1) * (motion.amplitude * 0.6)
+				offset = Vector3.new(x, 0, z)
+			elseif motion.pattern == "Jump" then
+				local x = math.sin(t * 1.4) * (motion.amplitude * 0.7)
+				local jumpArc = math.abs(math.sin(t * 3.0)) * 5.5
+				offset = Vector3.new(x, jumpArc, 0)
+			end
+
+			motion.root.CFrame = CFrame.new(basePos + offset) * motion.originCFrame.Rotation
+		end
+	end
+end
+
+function SimulationController:SpawnProjectile(params: {
+	originPos: Vector3,
+	direction: Vector3,
+	speed: number,
+	color: Color3?,
+	targetModel: Model?,
+	maxLifetime: number?,
+	onComplete: ((hitPos: Vector3, hitTarget: boolean, hitInstance: Instance?) -> ())?,
+})
+	local dir = if params.direction.Magnitude > 1e-5 then params.direction.Unit else Vector3.new(0, 0, -1)
+	local speed = math.max(10, params.speed)
+	local lifetime = if type(params.maxLifetime) == "number" and params.maxLifetime > 0 then params.maxLifetime else 2.5
+
+	local proj = Instance.new("Part")
+	proj.Name = "NovaHub_SimProjectile"
+	proj.Size = Vector3.new(0.3, 0.3, 2.0)
+	proj.Material = Enum.Material.Neon
+	proj.Color = params.color or Color3.fromRGB(255, 195, 95)
+	proj.Anchored = true
+	proj.CanCollide = false
+	proj.CastShadow = false
+	proj.CFrame = CFrame.lookAt(params.originPos, params.originPos + dir)
+	proj.Parent = workspace
+
+	local rayParams = RaycastParams.new()
+	rayParams.FilterType = Enum.RaycastFilterType.Exclude
+	local ignore: { Instance } = { proj }
+	if self.localPlayer and self.localPlayer.Character then
+		table.insert(ignore, self.localPlayer.Character)
+	end
+	rayParams.FilterDescendantsInstances = ignore
+	rayParams.IgnoreWater = true
+
+	local curPos = params.originPos
+	local elapsed = 0
+	local finished = false
+	local conn: RBXScriptConnection
+
+	local function finish(hitPos: Vector3, hitTarget: boolean, hitInst: Instance?)
+		if finished then
+			return
+		end
+		finished = true
+		if conn then
+			conn:Disconnect()
+		end
+		if params.onComplete then
+			params.onComplete(hitPos, hitTarget, hitInst)
+		end
+		task.delay(0.15, function()
+			if proj.Parent then
+				proj:Destroy()
+			end
+		end)
+	end
+
+	conn = game:GetService("RunService").Heartbeat:Connect(function(dt: number)
+		if finished then
+			return
+		end
+		elapsed += dt
+		local stepDist = speed * dt
+		local hit = workspace:Raycast(curPos, dir * stepDist, rayParams)
+
+		if hit then
+			proj.Position = hit.Position
+			local isTarget = false
+			if params.targetModel and hit.Instance:IsDescendantOf(params.targetModel) then
+				isTarget = true
+			end
+			finish(hit.Position, isTarget, hit.Instance)
+			return
+		end
+
+		curPos = curPos + dir * stepDist
+		proj.CFrame = CFrame.lookAt(curPos, curPos + dir)
+
+		if elapsed >= lifetime then
+			finish(curPos, false, nil)
+		end
+	end)
+
+	table.insert(self.activeProjectiles, conn)
+end
+
+
+-- ============================================================================
+-- 12. ReplicatedStorage/UIController (ModuleScript)
+-- ============================================================================
+export type TabId =
+	| "Dashboard"
+	| "FOV"
+	| "Prediction"
+	| "Visuals"
+	| "Simulation"
+	| "Stats"
+	| "Settings"
+	| "Debug"
+	| "About"
+
+export type LiveTelemetry = {
+	fps: number,
+	targetName: string,
+	targetRole: string,
+	worldDistStuds: number,
+	screenDistPx: number,
+	fovRadiusPx: number,
+	speedStudsPerSec: number,
+	accelStudsPerSec2: number,
+	predTimeSec: number,
+	offsetStuds: number,
+	meanErrorStuds: number?,
+	maxErrorStuds: number?,
+	lastErrorStuds: number?,
+	sampleCount: number,
+	roundPhase: string,
+	roundTimerSec: number,
+	autoPredEnabled: boolean,
+	visualsEnabled: boolean,
+	silentAimEnabled: boolean,
+	demoModeEnabled: boolean,
+	filterName: string,
+	statusLog: string,
+}
+
+export type UIActions = {
+	onToggleAutoPred: (enabled: boolean) -> (),
+	onToggleVisuals: (enabled: boolean) -> (),
+	onToggleSilentAim: (enabled: boolean) -> (),
+	onToggleDemoMode: (enabled: boolean) -> (),
+	onChangeStrength: (value: number) -> (),
+	onChangeAxis: (axis: "X" | "Y" | "Z", value: number) -> (),
+	onChangePing: (pingMs: number, pingCompEnabled: boolean) -> (),
+	onChangeFovRadius: (radiusPx: number, scaleByViewport: boolean) -> (),
+	onCycleFilter: () -> (),
+	onCycleRoundRole: () -> (),
+	onStartRound: () -> (),
+	onFireTestShot: () -> (),
+	onResetStats: () -> (),
+}
+
+local TAB_ORDER: { TabId } = {
+	"Dashboard",
+	"FOV",
+	"Prediction",
+	"Visuals",
+	"Simulation",
+	"Stats",
+	"Settings",
+	"Debug",
+	"About",
+}
+
+local THEME = {
+	BgMain = Color3.fromRGB(16, 18, 26),
+	BgCard = Color3.fromRGB(24, 28, 40),
+	BgButton = Color3.fromRGB(32, 37, 54),
+	BgActive = Color3.fromRGB(145, 130, 255),
+	AccentBlue = Color3.fromRGB(130, 195, 255),
+	TextPrimary = Color3.fromRGB(240, 244, 255),
+	TextMuted = Color3.fromRGB(155, 165, 195),
+	Stroke = Color3.fromRGB(58, 66, 94),
+}
+
+local UIController = {}
+UIController.__index = UIController
+
+local function makeCorner(parent: Instance, radiusPx: number)
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, radiusPx)
+	c.Parent = parent
+end
+
+local function makeStroke(parent: Instance, color: Color3, thickness: number?)
+	local s = Instance.new("UIStroke")
+	s.Color = color
+	s.Thickness = thickness or 1
+	s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	s.Parent = parent
+end
+
+local function makeLabel(
+	parent: Instance,
+	text: string,
+	textSize: number,
+	color: Color3?,
+	bold: boolean?
+): TextLabel
+	local lbl = Instance.new("TextLabel")
+	lbl.BackgroundTransparency = 1
+	lbl.Text = text
+	lbl.TextSize = textSize
+	lbl.TextColor3 = color or THEME.TextPrimary
+	lbl.Font = if bold then Enum.Font.GothamBold else Enum.Font.Gotham
+	lbl.TextXAlignment = Enum.TextXAlignment.Left
+	lbl.TextYAlignment = Enum.TextYAlignment.Center
+	lbl.Size = UDim2.new(1, 0, 0, math.max(18, textSize + 6))
+	lbl.Parent = parent
+	return lbl
+end
+
+local function makeToggleButton(
+	parent: Instance,
+	labelText: string,
+	initialState: boolean,
+	onClick: (newState: boolean) -> ()
+)
+	local state = initialState
+	local btn = Instance.new("TextButton")
+	btn.Size = UDim2.new(1, 0, 0, 34)
+	btn.Font = Enum.Font.GothamBold
+	btn.TextSize = 13
+	btn.AutoButtonColor = false
+	btn.Parent = parent
+	makeCorner(btn, 8)
+	makeStroke(btn, THEME.Stroke, 1)
+
+	local function refreshVisual()
+		btn.Text = string.format("%s: %s", labelText, if state then "ON" else "OFF")
+		btn.BackgroundColor3 = if state then THEME.BgActive else THEME.BgButton
+		btn.TextColor3 = if state then Color3.fromRGB(14, 16, 24) else THEME.TextPrimary
+	end
+
+	refreshVisual()
+	btn.MouseButton1Click:Connect(function()
+		state = not state
+		refreshVisual()
+		onClick(state)
+	end)
+end
+
+local function makeActionButton(parent: Instance, labelText: string, accent: Color3?, onClick: () -> ()): TextButton
+	local btn = Instance.new("TextButton")
+	btn.Size = UDim2.new(1, 0, 0, 34)
+	btn.BackgroundColor3 = accent or THEME.BgButton
+	btn.TextColor3 = if accent then Color3.fromRGB(14, 16, 24) else THEME.TextPrimary
+	btn.Font = Enum.Font.GothamBold
+	btn.TextSize = 13
+	btn.Text = labelText
+	btn.Parent = parent
+	makeCorner(btn, 8)
+	makeStroke(btn, THEME.Stroke, 1)
+	btn.MouseButton1Click:Connect(onClick)
+	return btn
+end
+
+local function makeStepperRow(
+	parent: Instance,
+	title: string,
+	initialVal: number,
+	step: number,
+	minVal: number,
+	maxVal: number,
+	formatStr: string,
+	onChange: (newVal: number) -> ()
+)
+	local current = math.clamp(initialVal, minVal, maxVal)
+	local row = Instance.new("Frame")
+	row.Size = UDim2.new(1, 0, 0, 36)
+	row.BackgroundColor3 = THEME.BgButton
+	row.Parent = parent
+	makeCorner(row, 8)
+	makeStroke(row, THEME.Stroke, 1)
+
+	local lbl = Instance.new("TextLabel")
+	lbl.BackgroundTransparency = 1
+	lbl.Position = UDim2.new(0, 10, 0, 0)
+	lbl.Size = UDim2.new(0.55, -10, 1, 0)
+	lbl.Font = Enum.Font.GothamMedium
+	lbl.TextSize = 12
+	lbl.TextColor3 = THEME.TextPrimary
+	lbl.TextXAlignment = Enum.TextXAlignment.Left
+	lbl.Parent = row
+
+	local minusBtn = Instance.new("TextButton")
+	minusBtn.Size = UDim2.fromOffset(30, 26)
+	minusBtn.Position = UDim2.new(1, -68, 0.5, -13)
+	minusBtn.BackgroundColor3 = THEME.BgCard
+	minusBtn.TextColor3 = THEME.AccentBlue
+	minusBtn.Font = Enum.Font.GothamBold
+	minusBtn.TextSize = 14
+	minusBtn.Text = "-"
+	minusBtn.Parent = row
+	makeCorner(minusBtn, 6)
+
+	local plusBtn = Instance.new("TextButton")
+	plusBtn.Size = UDim2.fromOffset(30, 26)
+	plusBtn.Position = UDim2.new(1, -34, 0.5, -13)
+	plusBtn.BackgroundColor3 = THEME.BgCard
+	plusBtn.TextColor3 = THEME.AccentBlue
+	plusBtn.Font = Enum.Font.GothamBold
+	plusBtn.TextSize = 14
+	plusBtn.Text = "+"
+	plusBtn.Parent = row
+	makeCorner(plusBtn, 6)
+
+	local function refreshText()
+		lbl.Text = string.format("%s: " .. formatStr, title, current)
+	end
+	refreshText()
+
+	local function applyDelta(delta: number)
+		current = math.clamp(current + delta, minVal, maxVal)
+		refreshText()
+		onChange(current)
+	end
+
+	minusBtn.MouseButton1Click:Connect(function()
+		applyDelta(-step)
+	end)
+	plusBtn.MouseButton1Click:Connect(function()
+		applyDelta(step)
+	end)
+end
+
+function UIController.new(playerGui: PlayerGui, actions: UIActions, initialConfig: {
+	autoPred: boolean,
+	visuals: boolean,
+	silentAim: boolean,
+	demoMode: boolean,
+	strength: number,
+	axisX: number,
+	axisY: number,
+	axisZ: number,
+	pingMs: number,
+	pingComp: boolean,
+	fovRadius: number,
+	scaleFov: boolean,
+}): any
+	local screenGui = Instance.new("ScreenGui")
+	screenGui.Name = "NovaHubTestSuiteGui"
+	screenGui.ResetOnSpawn = false
+	screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	screenGui.IgnoreGuiInset = true
+	screenGui.Parent = playerGui
+
+	local reopenBtn = Instance.new("TextButton")
+	reopenBtn.Name = "ReopenSuiteButton"
+	reopenBtn.Size = UDim2.fromOffset(142, 36)
+	reopenBtn.Position = UDim2.new(0, 14, 0, 14)
+	reopenBtn.BackgroundColor3 = THEME.BgMain
+	reopenBtn.TextColor3 = THEME.AccentBlue
+	reopenBtn.Font = Enum.Font.GothamBold
+	reopenBtn.TextSize = 12
+	reopenBtn.Text = "NOVAHUB · OPEN"
+	reopenBtn.Visible = false
+	reopenBtn.Parent = screenGui
+	makeCorner(reopenBtn, 8)
+	makeStroke(reopenBtn, THEME.AccentBlue, 1.5)
+
+	local mainWindow = Instance.new("Frame")
+	mainWindow.Name = "MainWindow"
+	mainWindow.Size = UDim2.fromOffset(540, 390)
+	mainWindow.Position = UDim2.new(0.5, -270, 0.5, -195)
+	mainWindow.BackgroundColor3 = THEME.BgMain
+	mainWindow.ClipsDescendants = true
+	mainWindow.Parent = screenGui
+	makeCorner(mainWindow, 12)
+	makeStroke(mainWindow, THEME.Stroke, 1.5)
+
+	local uiScale = Instance.new("UIScale")
+	uiScale.Parent = mainWindow
+
+	local topBar = Instance.new("Frame")
+	topBar.Name = "TopBar"
+	topBar.Size = UDim2.new(1, 0, 0, 42)
+	topBar.BackgroundColor3 = THEME.BgCard
+	topBar.Parent = mainWindow
+
+	local titleLbl = Instance.new("TextLabel")
+	titleLbl.BackgroundTransparency = 1
+	titleLbl.Position = UDim2.new(0, 12, 0, 0)
+	titleLbl.Size = UDim2.new(0.55, 0, 1, 0)
+	titleLbl.Font = Enum.Font.GothamBold
+	titleLbl.TextSize = 14
+	titleLbl.TextColor3 = THEME.TextPrimary
+	titleLbl.TextXAlignment = Enum.TextXAlignment.Left
+	titleLbl.Text = "NOVAHUB · TEST SUITE"
+	titleLbl.Parent = topBar
+
+	local badgeLbl = Instance.new("TextLabel")
+	badgeLbl.BackgroundColor3 = Color3.fromRGB(36, 44, 68)
+	badgeLbl.Position = UDim2.new(0, 198, 0.5, -10)
+	badgeLbl.Size = UDim2.fromOffset(66, 20)
+	badgeLbl.Font = Enum.Font.GothamBold
+	badgeLbl.TextSize = 11
+	badgeLbl.TextColor3 = THEME.AccentBlue
+	badgeLbl.Text = "Concepto"
+	badgeLbl.Parent = topBar
+	makeCorner(badgeLbl, 6)
+
+	local function makeWinBtn(text: string, offsetX: number, color: Color3): TextButton
+		local b = Instance.new("TextButton")
+		b.Size = UDim2.fromOffset(28, 28)
+		b.Position = UDim2.new(1, offsetX, 0.5, -14)
+		b.BackgroundColor3 = THEME.BgButton
+		b.TextColor3 = color
+		b.Font = Enum.Font.GothamBold
+		b.TextSize = 14
+		b.Text = text
+		b.Parent = topBar
+		makeCorner(b, 6)
+		return b
+	end
+
+	local closeBtn = makeWinBtn("×", -36, Color3.fromRGB(255, 110, 120))
+	local maxBtn = makeWinBtn("□", -68, THEME.AccentBlue)
+	local minBtn = makeWinBtn("−", -100, THEME.TextPrimary)
+
+	local dragging = false
+	local dragInput: InputObject? = nil
+	local dragStart = Vector3.zero
+	local startPos = UDim2.new()
+
+	topBar.InputBegan:Connect(function(input: InputObject)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			dragStart = input.Position
+			startPos = mainWindow.Position
+			dragInput = input
+			input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then
+					dragging = false
+				end
+			end)
+		end
+	end)
+
+	topBar.InputChanged:Connect(function(input: InputObject)
+		if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+			dragInput = input
+		end
+	end)
+
+	game:GetService("UserInputService").InputChanged:Connect(function(input: InputObject)
+		if dragging and input == dragInput then
+			local delta = input.Position - dragStart
+			mainWindow.Position = UDim2.new(
+				startPos.X.Scale,
+				startPos.X.Offset + delta.X,
+				startPos.Y.Scale,
+				startPos.Y.Offset + delta.Y
+			)
+		end
+	end)
+
+	local isMinimized = false
+	local isMaximized = false
+	local savedSize = mainWindow.Size
+	local savedPos = mainWindow.Position
+
+	local bodyFrame = Instance.new("Frame")
+	bodyFrame.Name = "BodyFrame"
+	bodyFrame.BackgroundTransparency = 1
+	bodyFrame.Position = UDim2.new(0, 0, 0, 42)
+	bodyFrame.Size = UDim2.new(1, 0, 1, -42)
+	bodyFrame.Parent = mainWindow
+
+	minBtn.MouseButton1Click:Connect(function()
+		isMinimized = not isMinimized
+		bodyFrame.Visible = not isMinimized
+		if isMinimized then
+			savedSize = mainWindow.Size
+			mainWindow.Size = UDim2.fromOffset(savedSize.X.Offset, 42)
+		else
+			mainWindow.Size = savedSize
+		end
+	end)
+
+	maxBtn.MouseButton1Click:Connect(function()
+		if isMinimized then
+			isMinimized = false
+			bodyFrame.Visible = true
+		end
+		isMaximized = not isMaximized
+		if isMaximized then
+			savedPos = mainWindow.Position
+			savedSize = mainWindow.Size
+			mainWindow.Position = UDim2.fromOffset(16, 16)
+			mainWindow.Size = UDim2.new(1, -32, 1, -32)
+		else
+			mainWindow.Position = savedPos
+			mainWindow.Size = savedSize
+		end
+	end)
+
+	closeBtn.MouseButton1Click:Connect(function()
+		mainWindow.Visible = false
+		reopenBtn.Visible = true
+	end)
+
+	reopenBtn.MouseButton1Click:Connect(function()
+		mainWindow.Visible = true
+		reopenBtn.Visible = false
+	end)
+
+	local navScroll = Instance.new("ScrollingFrame")
+	navScroll.Name = "TabNav"
+	navScroll.Position = UDim2.new(0, 8, 0, 8)
+	navScroll.Size = UDim2.new(0, 138, 1, -16)
+	navScroll.BackgroundColor3 = THEME.BgCard
+	navScroll.ScrollBarThickness = 3
+	navScroll.CanvasSize = UDim2.fromOffset(0, #TAB_ORDER * 38 + 10)
+	navScroll.Parent = bodyFrame
+	makeCorner(navScroll, 8)
+	makeStroke(navScroll, THEME.Stroke, 1)
+
+	local navLayout = Instance.new("UIListLayout")
+	navLayout.Padding = UDim.new(0, 5)
+	navLayout.Parent = navScroll
+
+	local navPad = Instance.new("UIPadding")
+	navPad.PaddingTop = UDim.new(0, 6)
+	navPad.PaddingLeft = UDim.new(0, 6)
+	navPad.PaddingRight = UDim.new(0, 6)
+	navPad.Parent = navScroll
+
+	local contentScroll = Instance.new("ScrollingFrame")
+	contentScroll.Name = "TabContent"
+	contentScroll.Position = UDim2.new(0, 154, 0, 8)
+	contentScroll.Size = UDim2.new(1, -162, 1, -16)
+	contentScroll.BackgroundColor3 = THEME.BgCard
+	contentScroll.ScrollBarThickness = 4
+	contentScroll.CanvasSize = UDim2.fromOffset(0, 520)
+	contentScroll.Parent = bodyFrame
+	makeCorner(contentScroll, 8)
+	makeStroke(contentScroll, THEME.Stroke, 1)
+
+	local contentLayout = Instance.new("UIListLayout")
+	contentLayout.Padding = UDim.new(0, 8)
+	contentLayout.Parent = contentScroll
+
+	local contentPad = Instance.new("UIPadding")
+	contentPad.PaddingTop = UDim.new(0, 10)
+	contentPad.PaddingLeft = UDim.new(0, 10)
+	contentPad.PaddingRight = UDim.new(0, 10)
+	contentPad.PaddingBottom = UDim.new(0, 10)
+	contentPad.Parent = contentScroll
+
+	local pages: { [TabId]: Frame } = {}
+	local tabButtons: { [TabId]: TextButton } = {}
+
+	local function selectTab(tabId: TabId)
+		for _, id in ipairs(TAB_ORDER) do
+			local page = pages[id]
+			local btn = tabButtons[id]
+			if page then
+				page.Visible = (id == tabId)
+			end
+			if btn then
+				local active = (id == tabId)
+				btn.BackgroundColor3 = if active then THEME.BgActive else THEME.BgButton
+				btn.TextColor3 = if active then Color3.fromRGB(14, 16, 24) else THEME.TextPrimary
+			end
+		end
+	end
+
+	for _, tabId in ipairs(TAB_ORDER) do
+		local tBtn = Instance.new("TextButton")
+		tBtn.Name = "Tab_" .. tabId
+		tBtn.Size = UDim2.new(1, 0, 0, 32)
+		tBtn.BackgroundColor3 = THEME.BgButton
+		tBtn.TextColor3 = THEME.TextPrimary
+		tBtn.Font = Enum.Font.GothamBold
+		tBtn.TextSize = 12
+		tBtn.Text = tabId
+		tBtn.Parent = navScroll
+		makeCorner(tBtn, 6)
+		tabButtons[tabId] = tBtn
+
+		local page = Instance.new("Frame")
+		page.Name = "Page_" .. tabId
+		page.Size = UDim2.new(1, 0, 0, 420)
+		page.BackgroundTransparency = 1
+		page.Visible = false
+		page.Parent = contentScroll
+
+		local pLayout = Instance.new("UIListLayout")
+		pLayout.Padding = UDim.new(0, 7)
+		pLayout.Parent = page
+
+		pages[tabId] = page
+
+		tBtn.MouseButton1Click:Connect(function()
+			selectTab(tabId)
+		end)
+	end
+
+	local dashSummaryLbl = makeLabel(pages.Dashboard, "Estado: Iniciando...", 13, THEME.AccentBlue, true)
+	local dashTargetLbl = makeLabel(pages.Dashboard, "Objetivo: Ninguno", 12, THEME.TextPrimary, false)
+	local dashMetricsLbl = makeLabel(pages.Dashboard, "Error prom.: -- | Máx.: --", 12, THEME.TextMuted, false)
+	makeToggleButton(pages.Dashboard, "Auto Prediction", initialConfig.autoPred, actions.onToggleAutoPred)
+	makeToggleButton(pages.Dashboard, "Role Visuals", initialConfig.visuals, actions.onToggleVisuals)
+	makeToggleButton(pages.Dashboard, "Silent Aim (Test)", initialConfig.silentAim, actions.onToggleSilentAim)
+	makeActionButton(pages.Dashboard, "Disparar Prueba", THEME.AccentBlue, actions.onFireTestShot)
+
+	local fovInfoLbl = makeLabel(pages.FOV, "FOV efectivo: -- px | Dist. pantalla: -- px", 12, THEME.AccentBlue, true)
+	makeStepperRow(pages.FOV, "Radio FOV base", initialConfig.fovRadius, 15, 40, 500, "%.0f px", actions.onChangeFovRadius)
+	makeToggleButton(pages.FOV, "Escalar por resolución", initialConfig.scaleFov, function(s)
+		actions.onChangeFovRadius(initialConfig.fovRadius, s)
+	end)
+	makeActionButton(pages.FOV, "Cambiar filtro de roles", nil, actions.onCycleFilter)
+
+	local predVelLbl = makeLabel(pages.Prediction, "Vel.: 0.0 st/s | Acel.: 0.0 st/s²", 12, THEME.AccentBlue, true)
+	local predTimeLbl = makeLabel(pages.Prediction, "t_pred: 0.000 s | Offset: 0.00 studs", 12, THEME.TextPrimary, false)
+	makeStepperRow(pages.Prediction, "Prediction Strength", initialConfig.strength, 0.1, 0.0, 2.5, "%.2f", actions.onChangeStrength)
+	makeStepperRow(pages.Prediction, "Axis X", initialConfig.axisX, 0.1, 0.0, 2.0, "%.2f", function(v)
+		actions.onChangeAxis("X", v)
+	end)
+	makeStepperRow(pages.Prediction, "Axis Y", initialConfig.axisY, 0.1, 0.0, 2.0, "%.2f", function(v)
+		actions.onChangeAxis("Y", v)
+	end)
+	makeStepperRow(pages.Prediction, "Axis Z", initialConfig.axisZ, 0.1, 0.0, 2.0, "%.2f", function(v)
+		actions.onChangeAxis("Z", v)
+	end)
+
+	local pingCompState = initialConfig.pingComp
+	local pingMsVal = initialConfig.pingMs
+	makeToggleButton(pages.Prediction, "Ping Compensation", pingCompState, function(s)
+		pingCompState = s
+		actions.onChangePing(pingMsVal, pingCompState)
+	end)
+	makeStepperRow(pages.Prediction, "Latencia simulada", pingMsVal, 10, 0, 500, "%.0f ms", function(v)
+		pingMsVal = v
+		actions.onChangePing(pingMsVal, pingCompState)
+	end)
+
+	local visRoundLbl = makeLabel(pages.Visuals, "Ronda: -- | Prep/Activa: --", 12, THEME.AccentBlue, true)
+	makeLabel(pages.Visuals, "Innocent: Verde | Sheriff: Azul | Hero: Amarillo | Murderer: Rojo", 11, THEME.TextMuted, false)
+	makeActionButton(pages.Visuals, "Iniciar Ronda (10s Prep)", THEME.AccentBlue, actions.onStartRound)
+	makeActionButton(pages.Visuals, "Rotar Rol Objetivo 1", nil, actions.onCycleRoundRole)
+
+	makeToggleButton(pages.Simulation, "Demo Mode", initialConfig.demoMode, actions.onToggleDemoMode)
+	makeActionButton(pages.Simulation, "Lanzar Proyectil de Prueba", THEME.AccentBlue, actions.onFireTestShot)
+	makeActionButton(pages.Simulation, "Reiniciar Ronda", nil, actions.onStartRound)
+
+	local statsMainLbl = makeLabel(pages.Stats, "Muestras: 0 | Error prom.: -- studs", 12, THEME.AccentBlue, true)
+	local statsExtLbl = makeLabel(pages.Stats, "Último error: -- | Error máx.: --", 12, THEME.TextPrimary, false)
+	makeActionButton(pages.Stats, "Limpiar Estadísticas", nil, actions.onResetStats)
+
+	makeLabel(pages.Settings, "Ajustes rápidos de prueba local", 12, THEME.AccentBlue, true)
+	makeActionButton(pages.Settings, "Cambiar filtro de roles", nil, actions.onCycleFilter)
+
+	local debugLogLbl = makeLabel(pages.Debug, "Log: Listo", 11, THEME.TextMuted, false)
+	debugLogLbl.TextWrapped = true
+	debugLogLbl.Size = UDim2.new(1, 0, 0, 54)
+
+	makeLabel(pages.About, "NOVAHUB · TEST SUITE (Entorno Privado)", 13, THEME.AccentBlue, true)
+	makeLabel(pages.About, "Suite modular de pruebas locales para Roblox Studio", 11, THEME.TextMuted, false)
+
+	selectTab("Dashboard")
+
+	local self = {
+		screenGui = screenGui,
+		mainWindow = mainWindow,
+		uiScale = uiScale,
+		dashSummaryLbl = dashSummaryLbl,
+		dashTargetLbl = dashTargetLbl,
+		dashMetricsLbl = dashMetricsLbl,
+		fovInfoLbl = fovInfoLbl,
+		predVelLbl = predVelLbl,
+		predTimeLbl = predTimeLbl,
+		visRoundLbl = visRoundLbl,
+		statsMainLbl = statsMainLbl,
+		statsExtLbl = statsExtLbl,
+		debugLogLbl = debugLogLbl,
+	}
+
+	return setmetatable(self, UIController)
+end
+
+function UIController:UpdateScale(viewportSize: Vector2)
+	if viewportSize.Y <= 0 then
+		return
+	end
+	local scale = math.clamp(viewportSize.Y / 760, 0.72, 1.15)
+	if viewportSize.X < 650 then
+		scale = math.clamp(viewportSize.X / 580, 0.65, 1.0)
+	end
+	self.uiScale.Scale = scale
+end
+
+function UIController:UpdateTelemetry(t: LiveTelemetry)
+	local meanStr = if t.meanErrorStuds then string.format("%.2f st", t.meanErrorStuds) else "--"
+	local maxStr = if t.maxErrorStuds then string.format("%.2f st", t.maxErrorStuds) else "--"
+	local lastStr = if t.lastErrorStuds then string.format("%.2f st", t.lastErrorStuds) else "--"
+
+	self.dashSummaryLbl.Text = string.format("FPS: %.0f | Ronda: %s | Filtro: %s", t.fps, t.roundPhase, t.filterName)
+	self.dashTargetLbl.Text = string.format("Objetivo: %s (%s) | Dist.: %.1f st", t.targetName, t.targetRole, t.worldDistStuds)
+	self.dashMetricsLbl.Text = string.format("Error prom.: %s | Máx.: %s", meanStr, maxStr)
+
+	self.fovInfoLbl.Text = string.format("FOV efectivo: %.0f px | Dist. mira: %.0f px", t.fovRadiusPx, t.screenDistPx)
+	self.predVelLbl.Text = string.format("Vel.: %.1f st/s | Acel.: %.1f st/s²", t.speedStudsPerSec, t.accelStudsPerSec2)
+	self.predTimeLbl.Text = string.format("t_pred: %.3f s | Offset: %.2f studs", t.predTimeSec, t.offsetStuds)
+
+	self.visRoundLbl.Text = string.format("Fase: %s | Tiempo: %.1f s", t.roundPhase, t.roundTimerSec)
+	self.statsMainLbl.Text = string.format("Muestras: %d | Error prom.: %s", t.sampleCount, meanStr)
+	self.statsExtLbl.Text = string.format("Último error: %s | Error máx.: %s", lastStr, maxStr)
+	self.debugLogLbl.Text = "Log: " .. t.statusLog
+end
+
+
+-- ============================================================================
+-- 13. StarterPlayerScripts/NovaHubMasterTestSuite (LocalScript)
+-- ============================================================================
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+
+local player = Players.LocalPlayer
+local camera = workspace.CurrentCamera
+
+local settingsMgr = SettingsManager.new()
+local profileMgr = ProfileManager.new(settingsMgr)
+local telemetry = TelemetryController.new(1000)
+local perfMon = PerformanceMonitor.new(0.12)
+local entityMgr = EntityManager.new(player)
+local debugCtrl = DebugController.new(150)
+local simCtrl = SimulationController.new(player)
+
+local initialSettings = settingsMgr:Get()
+
+local visuals = RoleVisualsController.new()
+visuals:SetEnabled(initialSettings.VisualsEnabled)
+
+local engine = AutoPredictionEngine.new({
+	AutoPrediction = initialSettings.AutoPrediction,
+	PredictionStrength = initialSettings.PredictionStrength,
+	AxisWeights = {
+		X = initialSettings.AxisWeights.X,
+		Y = initialSettings.AxisWeights.Y,
+		Z = initialSettings.AxisWeights.Z,
+	},
+	DynamicPrediction = initialSettings.DynamicPrediction,
+	PingCompensation = initialSettings.PingCompensation,
+	PingSeconds = initialSettings.PingSeconds,
+	ProjectileSpeed = initialSettings.ProjectileSpeed,
+	MaxPredictionTime = initialSettings.MaxPredictionTime,
+})
+
+local selector = TargetSelector.new(engine, visuals, {
+	BaseFovRadiusPx = initialSettings.BaseFovRadiusPx,
+	ScaleFovByViewport = initialSettings.ScaleFovByViewport,
+	CheckPredictedInFov = false,
+	RequireLineOfSight = initialSettings.RequireLineOfSight,
+	UsePredictedForRay = false,
+	MaxRayDistance = 250,
+	PriorityMode = "RoleFirst",
+	AllowedRoles = nil,
+	RoleWeights = {
+		Murderer = 4.0,
+		Sheriff = 3.0,
+		Hero = 3.0,
+		Innocent = 1.0,
+		Unknown = 0.5,
+	},
+})
+
+local aimController = SilentAimController.new(selector)
+aimController:SetEnabled(initialSettings.SilentAimEnabled)
+aimController:SetDemoMode(initialSettings.DemoModeEnabled)
+
+local impactMarker = Instance.new("Part")
+impactMarker.Name = "NovaHub_ImpactMarker"
+impactMarker.Shape = Enum.PartType.Ball
+impactMarker.Size = Vector3.new(1.0, 1.0, 1.0)
+impactMarker.Material = Enum.Material.Neon
+impactMarker.Color = Color3.fromRGB(255, 115, 130)
+impactMarker.Anchored = true
+impactMarker.CanCollide = false
+impactMarker.CastShadow = false
+impactMarker.Transparency = 1
+impactMarker.Parent = workspace
+
+local impactFadeToken = 0
+local function showImpactMarker(pos: Vector3, color: Color3)
+	impactFadeToken += 1
+	local myToken = impactFadeToken
+	impactMarker.Position = pos
+	impactMarker.Color = color
+	impactMarker.Transparency = 0.1
+	task.delay(0.9, function()
+		if impactFadeToken == myToken and impactMarker.Parent then
+			impactMarker.Transparency = 1
+		end
+	end)
+end
+
+local function syncFromSettings(s: SuiteSettings)
+	engine:SetConfig({
+		AutoPrediction = s.AutoPrediction,
+		PredictionStrength = s.PredictionStrength,
+		AxisWeights = {
+			X = s.AxisWeights.X,
+			Y = s.AxisWeights.Y,
+			Z = s.AxisWeights.Z,
+		},
+		DynamicPrediction = s.DynamicPrediction,
+		PingCompensation = s.PingCompensation,
+		PingSeconds = s.PingSeconds,
+		ProjectileSpeed = s.ProjectileSpeed,
+		MaxPredictionTime = s.MaxPredictionTime,
+	})
+	selector:SetConfig({
+		BaseFovRadiusPx = s.BaseFovRadiusPx,
+		ScaleFovByViewport = s.ScaleFovByViewport,
+		RequireLineOfSight = s.RequireLineOfSight,
+	})
+	visuals:SetEnabled(s.VisualsEnabled)
+	aimController:SetEnabled(s.SilentAimEnabled)
+	aimController:SetDemoMode(s.DemoModeEnabled)
+end
+
+syncFromSettings(initialSettings)
+settingsMgr:Subscribe(function(updated)
+	syncFromSettings(updated)
+end)
+
+local PREP_DURATION = 10
+local roundPhase: RoundPhase = "Idle"
+local roundRemaining = 0
+local roundThread: thread? = nil
+
+local filterIdx = 1
+local FILTER_MODES: { { name: string, allowed: { [RoleOrUnknown]: boolean }? } } = {
+	{ name = "Todos", allowed = nil },
+	{ name = "Solo Murderer", allowed = { Murderer = true, Sheriff = false, Hero = false, Innocent = false, Unknown = false } },
+	{ name = "Sheriff/Hero", allowed = { Murderer = false, Sheriff = true, Hero = true, Innocent = false, Unknown = false } },
+	{ name = "Sin Innocent", allowed = { Murderer = true, Sheriff = true, Hero = true, Innocent = false, Unknown = true } },
+}
+
+local ROLE_CYCLE: { RoleName } = { "Innocent", "Sheriff", "Hero", "Murderer" }
+local manualRoleIdx = 0
+
+local function pushLog(level: "INFO" | "WARN" | "ERROR", msg: string)
+	debugCtrl:Log(level, msg, os.clock())
+end
+
+local function getRefScreenPoint(): Vector2
+	if not camera then
+		return Vector2.zero
+	end
+	if UserInputService.MouseBehavior == Enum.MouseBehavior.LockCenter then
+		return Vector2.new(camera.ViewportSize.X * 0.5, camera.ViewportSize.Y * 0.5)
+	end
+	local m = UserInputService:GetMouseLocation()
+	return Vector2.new(m.X, m.Y)
+end
+
+local function bindDummyMotions()
+	simCtrl:ClearDummyMotions()
+	for _, ent in ipairs(entityMgr:GetEntities()) do
+		if ent.isDummy then
+			if string.find(string.lower(ent.id), "zigzag") then
+				simCtrl:SetDummyMotion(ent.id, ent.model, ent.anchorPart, "ZigZag", 15, 9)
+			elseif string.find(string.lower(ent.id), "jump") then
+				simCtrl:SetDummyMotion(ent.id, ent.model, ent.anchorPart, "Jump", 14, 8)
+			elseif string.find(string.lower(ent.id), "linear") then
+				simCtrl:SetDummyMotion(ent.id, ent.model, ent.anchorPart, "Linear", 16, 10)
+			end
+		end
+	end
+end
+
+local function startRound()
+	if roundThread then
+		task.cancel(roundThread)
+		roundThread = nil
+	end
+
+	engine:ClearAllTargets()
+	entityMgr:Refresh(true)
+	bindDummyMotions()
+
+	local visualEntities = entityMgr:GetVisualEntities()
+	local rolesMap: { [string]: RoleName } = {}
+
+	local idx = 0
+	for _, ent in ipairs(visualEntities) do
+		idx += 1
+		if ent.id == player.Name then
+			rolesMap[ent.id] = "Innocent"
+		elseif idx == 2 then
+			rolesMap[ent.id] = "Murderer"
+		elseif idx == 3 then
+			rolesMap[ent.id] = "Sheriff"
+		elseif idx == 4 then
+			rolesMap[ent.id] = "Hero"
+		else
+			rolesMap[ent.id] = "Innocent"
+		end
+	end
+
+	visuals:ClearRoles()
+	visuals:AssignRolesBulk(rolesMap, true)
+	roundPhase = "Preparation"
+	roundRemaining = PREP_DURATION
+	visuals:SetRoundState(true, "Preparation")
+	visuals:SyncEntities(visualEntities)
+	pushLog("INFO", "Ronda iniciada: 10s de preparación")
+
+	roundThread = task.spawn(function()
+		for sec = PREP_DURATION, 1, -1 do
+			roundRemaining = sec
+			task.wait(1)
+		end
+		roundPhase = "ActiveRound"
+		roundRemaining = 0
+		visuals:SetRoundState(true, "ActiveRound")
+		visuals:SyncEntities(entityMgr:GetVisualEntities())
+		pushLog("INFO", "Preparación finalizada: Ronda activa")
+	end)
+end
+
+local function cycleFilter()
+	filterIdx = (filterIdx % #FILTER_MODES) + 1
+	local mode = FILTER_MODES[filterIdx]
+	selector:SetConfig({ AllowedRoles = mode.allowed })
+	pushLog("INFO", "Filtro -> " .. mode.name)
+end
+
+local function cycleFirstTargetRole()
+	local candidates = entityMgr:GetSelectorCandidates()
+	local first = candidates[1]
+	if not first then
+		pushLog("WARN", "Sin objetivos para rotar rol")
+		return
+	end
+	manualRoleIdx = (manualRoleIdx % #ROLE_CYCLE) + 1
+	local nextRole = ROLE_CYCLE[manualRoleIdx]
+	visuals:AssignRole(first.id, nextRole)
+	visuals:SyncEntities(entityMgr:GetVisualEntities())
+	pushLog("INFO", string.format("%s -> %s", first.id, nextRole))
+end
+
+local lastFireTime = 0
+local function fireTestShot()
+	local now = os.clock()
+	if now - lastFireTime < 0.35 or not camera then
+		return
+	end
+	lastFireTime = now
+
+	local currentSettings = settingsMgr:Get()
+	local originPos = camera.CFrame.Position
+	local fallbackDir = camera.CFrame.LookVector
+	local refPoint = getRefScreenPoint()
+	local candidates = entityMgr:GetSelectorCandidates()
+
+	local aim = aimController:ResolveAim(
+		camera,
+		originPos,
+		fallbackDir,
+		refPoint,
+		candidates,
+		player.Character,
+		now
+	)
+
+	local shotColor = if aim.role then visuals:GetRoleColor(aim.role) else Color3.fromRGB(255, 195, 95)
+	local targetId = aim.targetId
+	local targetModel = aim.targetModel
+	local predictedAimPoint = aim.aimPoint
+	local predTime = aim.predictedTime
+	local worldDist = aim.worldDistance
+
+	local st = if targetId then engine.targets[targetId] else nil
+	local curSpeed = if st then st.velocity.Magnitude else 0
+
+	if currentSettings.DemoModeEnabled then
+		simCtrl:SpawnProjectile({
+			originPos = originPos,
+			direction = aim.direction,
+			speed = math.max(currentSettings.ProjectileSpeed, 70),
+			color = shotColor,
+			targetModel = targetModel,
+			maxLifetime = 2.2,
+			onComplete = function(hitPos: Vector3, hitTarget: boolean, _hitInst: Instance?)
+				showImpactMarker(hitPos, shotColor)
+
+				if aim.hasTarget and targetId and targetModel then
+					local anchor = targetModel:FindFirstChild("HumanoidRootPart") :: BasePart?
+					local actualPos = if anchor and anchor.Parent then anchor.Position else hitPos
+					local diffStuds = (predictedAimPoint - actualPos).Magnitude
+
+					telemetry:Record({
+						targetId = targetId,
+						errorStuds = diffStuds,
+						predictedTime = predTime,
+						distanceStuds = worldDist,
+						speedStudsPerSec = curSpeed,
+						simulated = true,
+						timestamp = os.clock(),
+					})
+
+					pushLog(
+						"INFO",
+						string.format(
+							"Impacto (%s) | Pred vs Real: %.2f st | %s",
+							targetId,
+							diffStuds,
+							if hitTarget then "HIT" else "MISS"
+						)
+					)
+				end
+			end,
+		})
+	end
+end
+
+local ui = UIController.new(player:WaitForChild("PlayerGui"), {
+	onToggleAutoPred = function(enabled: boolean)
+		settingsMgr:SetValue("AutoPrediction", enabled)
+		pushLog("INFO", "AutoPrediction = " .. tostring(enabled))
+	end,
+	onToggleVisuals = function(enabled: boolean)
+		settingsMgr:SetValue("VisualsEnabled", enabled)
+		visuals:SyncEntities(entityMgr:GetVisualEntities())
+		pushLog("INFO", "RoleVisuals = " .. tostring(enabled))
+	end,
+	onToggleSilentAim = function(enabled: boolean)
+		settingsMgr:SetValue("SilentAimEnabled", enabled)
+		pushLog("INFO", "SilentAim = " .. tostring(enabled))
+	end,
+	onToggleDemoMode = function(enabled: boolean)
+		settingsMgr:SetValue("DemoModeEnabled", enabled)
+		pushLog("INFO", "DemoMode = " .. tostring(enabled))
+	end,
+	onChangeStrength = function(val: number)
+		settingsMgr:SetValue("PredictionStrength", val)
+	end,
+	onChangeAxis = function(axis: "X" | "Y" | "Z", val: number)
+		settingsMgr:SetValue("Axis" .. axis, val)
+	end,
+	onChangePing = function(pingMs: number, pingCompEnabled: boolean)
+		settingsMgr:SetValue("PingSeconds", pingMs / 1000)
+		settingsMgr:SetValue("PingCompensation", pingCompEnabled)
+	end,
+	onChangeFovRadius = function(radiusPx: number, scaleByViewport: boolean)
+		settingsMgr:SetValue("BaseFovRadiusPx", radiusPx)
+		settingsMgr:SetValue("ScaleFovByViewport", scaleByViewport)
+	end,
+	onCycleFilter = cycleFilter,
+	onCycleRoundRole = cycleFirstTargetRole,
+	onStartRound = startRound,
+	onFireTestShot = fireTestShot,
+	onResetStats = function()
+		telemetry:Clear()
+		engine:ClearSamples()
+		pushLog("INFO", "Telemetría reiniciada")
+	end,
+}, {
+	autoPred = initialSettings.AutoPrediction,
+	visuals = initialSettings.VisualsEnabled,
+	silentAim = initialSettings.SilentAimEnabled,
+	demoMode = initialSettings.DemoModeEnabled,
+	strength = initialSettings.PredictionStrength,
+	axisX = initialSettings.AxisWeights.X,
+	axisY = initialSettings.AxisWeights.Y,
+	axisZ = initialSettings.AxisWeights.Z,
+	pingMs = initialSettings.PingSeconds * 1000,
+	pingComp = initialSettings.PingCompensation,
+	fovRadius = initialSettings.BaseFovRadiusPx,
+	scaleFov = initialSettings.ScaleFovByViewport,
+})
+
+profileMgr:LoadProfile("Balanced_Test")
+
+local fovGui = Instance.new("ScreenGui")
+fovGui.Name = "NovaHub_FovOverlay"
+fovGui.ResetOnSpawn = false
+fovGui.IgnoreGuiInset = true
+fovGui.Parent = player:WaitForChild("PlayerGui")
+
+local fovCircle = Instance.new("Frame")
+fovCircle.AnchorPoint = Vector2.new(0.5, 0.5)
+fovCircle.BackgroundTransparency = 1
+fovCircle.Parent = fovGui
+
+local fovStroke = Instance.new("UIStroke")
+fovStroke.Thickness = 2
+fovStroke.Color = Color3.fromRGB(130, 195, 255)
+fovStroke.Parent = fovCircle
+
+local fovCorner = Instance.new("UICorner")
+fovCorner.CornerRadius = UDim.new(1, 0)
+fovCorner.Parent = fovCircle
+
+UserInputService.InputBegan:Connect(function(input: InputObject, gameProcessed: boolean)
+	if gameProcessed then
+		return
+	end
+	if input.KeyCode == Enum.KeyCode.V then
+		settingsMgr:SetValue("VisualsEnabled", not visuals:IsEnabled())
+		visuals:SyncEntities(entityMgr:GetVisualEntities())
+	elseif input.KeyCode == Enum.KeyCode.P then
+		settingsMgr:SetValue("AutoPrediction", not engine.config.AutoPrediction)
+	elseif input.KeyCode == Enum.KeyCode.F then
+		cycleFilter()
+	elseif input.KeyCode == Enum.KeyCode.G then
+		cycleFirstTargetRole()
+	elseif input.KeyCode == Enum.KeyCode.R then
+		startRound()
+	elseif input.UserInputType == Enum.UserInputType.MouseButton1 or input.KeyCode == Enum.KeyCode.E then
+		fireTestShot()
+	end
+end)
+
+local lastEntityRefresh = 0
+local lastUiUpdate = 0
+local lastViewport = Vector2.zero
+
+RunService.RenderStepped:Connect(function(dt: number)
+	local now = os.clock()
+	local perf = perfMon:Step(dt, now)
+
+	simCtrl:StepMotions(dt)
+	engine:StepEvaluations(now)
+
+	if now - lastEntityRefresh >= 0.25 then
+		lastEntityRefresh = now
+		entityMgr:Refresh(true)
+		visuals:SyncEntities(entityMgr:GetVisualEntities())
+	end
+
+	if not camera then
+		return
+	end
+
+	if camera.ViewportSize ~= lastViewport then
+		lastViewport = camera.ViewportSize
+		ui:UpdateScale(camera.ViewportSize)
+	end
+
+	local fovRadiusPx = selector:GetEffectiveFovRadius(camera)
+	local refPoint = getRefScreenPoint()
+	fovCircle.Size = UDim2.fromOffset(fovRadiusPx * 2, fovRadiusPx * 2)
+	fovCircle.Position = UDim2.fromOffset(refPoint.X, refPoint.Y)
+
+	local originPos = camera.CFrame.Position
+	local candidates = entityMgr:GetSelectorCandidates()
+	local best = selector:SelectBestTarget(
+		camera,
+		originPos,
+		refPoint,
+		candidates,
+		player.Character,
+		now
+	)
+
+	local targetName = "Ninguno"
+	local targetRole = "--"
+	local worldDist = 0
+	local screenDist = 0
+	local speed = 0
+	local accel = 0
+	local predTime = 0
+	local offsetStuds = 0
+
+	if best then
+		targetName = best.targetId
+		targetRole = tostring(best.role)
+		worldDist = best.worldDistance
+		screenDist = best.screenDistPx
+		predTime = best.predictedTime
+		offsetStuds = (best.predictedPos - best.currentPos).Magnitude
+
+		local st = engine.targets[best.targetId]
+		if st then
+			speed = st.velocity.Magnitude
+			accel = st.acceleration.Magnitude
+		end
+
+		local col = visuals:GetRoleColor(best.role)
+		debugCtrl:UpdatePredictedMarker(best.predictedPos, col, true)
+		debugCtrl:UpdateAimLine(originPos, best.predictedPos, col, settingsMgr:Get().DemoModeEnabled)
+		fovStroke.Color = col
+	else
+		debugCtrl:UpdatePredictedMarker(nil, nil, false)
+		debugCtrl:UpdateAimLine(nil, nil, nil, false)
+		fovStroke.Color = Color3.fromRGB(130, 195, 255)
+	end
+
+	if now - lastUiUpdate >= 0.066 then
+		lastUiUpdate = now
+		local stats = telemetry:ComputeStats(nil)
+		local logs = debugCtrl:GetRecentLogs(1)
+		local latestLog = if logs[1] then logs[1].message else "Listo"
+		local curS = settingsMgr:Get()
+
+		ui:UpdateTelemetry({
+			fps = perf.fps,
+			targetName = targetName,
+			targetRole = targetRole,
+			worldDistStuds = worldDist,
+			screenDistPx = screenDist,
+			fovRadiusPx = fovRadiusPx,
+			speedStudsPerSec = speed,
+			accelStudsPerSec2 = accel,
+			predTimeSec = predTime,
+			offsetStuds = offsetStuds,
+			meanErrorStuds = stats.meanError,
+			maxErrorStuds = stats.maxError,
+			lastErrorStuds = stats.lastError,
+			sampleCount = stats.count,
+			roundPhase = roundPhase,
+			roundTimerSec = roundRemaining,
+			autoPredEnabled = curS.AutoPrediction,
+			visualsEnabled = curS.VisualsEnabled,
+			silentAimEnabled = curS.SilentAimEnabled,
+			demoModeEnabled = curS.DemoModeEnabled,
+			filterName = FILTER_MODES[filterIdx].name,
+			statusLog = latestLog,
+		})
+	end
+end)
+
+startRound()
